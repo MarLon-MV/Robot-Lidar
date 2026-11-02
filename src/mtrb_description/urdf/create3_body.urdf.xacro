@@ -1,0 +1,140 @@
+<?xml version="1.0"?>
+<!-- iRobot Create 3: body, bumper, wheels, caster and the frames of its built-in sensors.
+     Kinematics and visuals only (no simulation). -->
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:include filename="$(find mtrb_description)/urdf/common_properties.urdf.xacro"/>
+  <xacro:include filename="$(find mtrb_description)/urdf/bumper.urdf.xacro"/>
+  <xacro:include filename="$(find mtrb_description)/urdf/caster.urdf.xacro"/>
+  <xacro:include filename="$(find mtrb_description)/urdf/wheel.urdf.xacro"/>
+
+  <!-- Every frame below is raised by this offset (base_link sits on the floor). -->
+  <xacro:property name="z0" value="${6.42*cm2m}"/>
+
+  <!-- Body -->
+  <xacro:property name="body_z_offset"           value="${-2.5*cm2m}"/>
+  <xacro:property name="body_collision_z_offset" value="${1*cm2m}"/>
+  <xacro:property name="body_mass"               value="2.300"/>
+  <xacro:property name="body_radius"             value="${16.4*cm2m}"/>
+  <xacro:property name="body_length"             value="${6*cm2m}"/>
+
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 ${body_z_offset + z0}" rpy="0 0 ${pi/2}"/>
+      <geometry>
+        <mesh filename="package://mtrb_description/meshes/body_visual.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${body_z_offset + body_collision_z_offset + z0}" rpy="0 0 ${pi/2}"/>
+      <geometry>
+        <cylinder length="${body_length}" radius="${body_radius}"/>
+      </geometry>
+    </collision>
+    <xacro:inertial_cylinder_with_pose mass="${body_mass}" radius="${body_radius}" length="${body_length}">
+      <origin xyz="0 0 ${body_collision_z_offset + z0}"/>
+    </xacro:inertial_cylinder_with_pose>
+  </link>
+
+  <!-- Bumper -->
+  <xacro:bumper visual_mesh="package://mtrb_description/meshes/bumper_visual.dae"
+                collision_mesh="package://mtrb_description/meshes/bumper_collision.dae">
+    <origin xyz="0 0 ${-2.5*cm2m + z0}"/>
+    <inertial>
+      <origin xyz="${8*cm2m} 0 ${2*cm2m}"/>
+      <mass value="0.1"/>
+      <inertia ixx="0.0013483753405" ixy="0.0000000454352" ixz="0.0000014434849"
+               iyy="0.0002521736852" iyz="-0.0000000006721" izz="0.0015442525386"/>
+    </inertial>
+  </xacro:bumper>
+
+  <!-- Wheels (wheel-drop slider + wheel) and caster -->
+  <xacro:property name="wheel_drop_z"            value="${-2.75*cm2m + 3.5*mm2m + z0}"/>
+  <xacro:property name="distance_between_wheels" value="${23.3*cm2m}"/>
+
+  <xacro:wheel_with_wheeldrop name="left">
+    <origin xyz="0 ${distance_between_wheels/2} ${wheel_drop_z}" rpy="${-pi/2} 0 0"/>
+  </xacro:wheel_with_wheeldrop>
+  <xacro:wheel_with_wheeldrop name="right">
+    <origin xyz="0 ${-distance_between_wheels/2} ${wheel_drop_z}" rpy="${-pi/2} 0 0"/>
+  </xacro:wheel_with_wheeldrop>
+
+  <xacro:caster name="front_caster" parent_link="base_link">
+    <origin xyz="${12.5*cm2m} 0 ${-5.2*cm2m + z0}" rpy="${-pi/2} 0 0"/>
+  </xacro:caster>
+
+  <!-- IMU and optical mouse -->
+  <joint name="imu_joint" type="fixed">
+    <origin xyz="0.050613 0.043673 ${0.0202 + z0}"/>
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+  </joint>
+  <link name="imu_link"/>
+  <xacro:fixed_frame name="optical_mouse">
+    <origin xyz="0.1015 0.087 ${-0.055 + z0}" rpy="0 0 ${-pi/4}"/>
+  </xacro:fixed_frame>
+
+  <!-- Cliff sensors (pointing down at 80 degrees) -->
+  <xacro:property name="cliff_z"     value="${-4.5*cm2m + z0}"/>
+  <xacro:property name="cliff_pitch" value="${80*deg2rad}"/>
+  <xacro:property name="cliff_front_yaw" value="${65.3*deg2rad}"/>
+  <xacro:property name="cliff_side_yaw"  value="${167.4*deg2rad}"/>
+
+  <xacro:fixed_frame name="cliff_side_left">
+    <origin xyz="${6*cm2m} ${14.5*cm2m} ${cliff_z}" rpy="0 ${cliff_pitch} ${cliff_side_yaw}"/>
+  </xacro:fixed_frame>
+  <xacro:fixed_frame name="cliff_side_right">
+    <origin xyz="${6*cm2m} ${-14.5*cm2m} ${cliff_z}" rpy="0 ${cliff_pitch} ${-cliff_side_yaw}"/>
+  </xacro:fixed_frame>
+  <xacro:fixed_frame name="cliff_front_left">
+    <origin xyz="${16*cm2m} ${4.5*cm2m} ${cliff_z}" rpy="0 ${cliff_pitch} ${cliff_front_yaw}"/>
+  </xacro:fixed_frame>
+  <xacro:fixed_frame name="cliff_front_right">
+    <origin xyz="${16*cm2m} ${-4.5*cm2m} ${cliff_z}" rpy="0 ${cliff_pitch} ${-cliff_front_yaw}"/>
+  </xacro:fixed_frame>
+
+  <!-- IR intensity sensors (top view, front up):
+                        front_center_left
+              front_left            front_center_right
+          left                                    front_right
+  side_left                                                   right            -->
+  <xacro:property name="ir_z" value="${-0.7*cm2m + z0}"/>
+
+  <xacro:fixed_frame name="ir_intensity_front_center_left">
+    <origin xyz="0.1540 0 ${ir_z}"/>
+  </xacro:fixed_frame>
+  <xacro:fixed_frame name="ir_intensity_front_center_right">
+    <origin xyz="0.1396 -0.0651 ${ir_z}" rpy="0 0 -0.436"/>
+  </xacro:fixed_frame>
+  <xacro:fixed_frame name="ir_intensity_front_left">
+    <origin xyz="0.1396 0.0651 ${ir_z}" rpy="0 0 0.436"/>
+  </xacro:fixed_frame>
+  <xacro:fixed_frame name="ir_intensity_front_right">
+    <origin xyz="0.0990 -0.1180 ${ir_z}" rpy="0 0 -0.873"/>
+  </xacro:fixed_frame>
+  <xacro:fixed_frame name="ir_intensity_left">
+    <origin xyz="0.0990 0.1180 ${ir_z}" rpy="0 0 0.873"/>
+  </xacro:fixed_frame>
+  <xacro:fixed_frame name="ir_intensity_right">
+    <origin xyz="0.0399 -0.1488 ${ir_z}" rpy="0 0 -1.309"/>
+  </xacro:fixed_frame>
+  <xacro:fixed_frame name="ir_intensity_side_left">
+    <origin xyz="0.0399 0.1488 ${ir_z}" rpy="0 0 1.309"/>
+  </xacro:fixed_frame>
+
+  <!-- Omni IR receiver (docking) -->
+  <xacro:fixed_frame name="ir_omni">
+    <origin xyz="0.153 0 ${0.035 + z0}"/>
+  </xacro:fixed_frame>
+
+  <!-- Buttons -->
+  <xacro:fixed_frame name="button_1">
+    <origin xyz="0.06 0.37 ${0.08 + z0}" rpy="0 ${-pi/2} 0"/>
+  </xacro:fixed_frame>
+  <xacro:fixed_frame name="button_2">
+    <origin xyz="0.06 -0.37 ${0.08 + z0}" rpy="0 ${-pi/2} 0"/>
+  </xacro:fixed_frame>
+  <xacro:fixed_frame name="button_power">
+    <origin xyz="0.06 0 ${0.08 + z0}" rpy="0 ${-pi/2} 0"/>
+  </xacro:fixed_frame>
+
+</robot>

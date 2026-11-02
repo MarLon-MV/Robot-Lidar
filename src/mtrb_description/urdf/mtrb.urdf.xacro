@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<robot name="mtrb" xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <!-- lidar_only:=true emits just base_link + the LiDAR joint. Used for TF, because
+       the Create 3 already publishes the rest of its own tree on /r2/tf_static. -->
+  <xacro:arg name="lidar_only"  default="false"/>
+
+  <!-- LiDAR mount relative to base_link (metres / radians). -->
+  <xacro:arg name="lidar_frame" default="laser"/>
+  <xacro:arg name="lidar_x"     default="0.0"/>
+  <xacro:arg name="lidar_y"     default="0.0"/>
+  <xacro:arg name="lidar_z"     default="0.1"/>
+  <xacro:arg name="lidar_yaw"   default="0.0"/>  <!-- ldlidar_stl_ros2: LD19 front = robot front -->
+
+  <xacro:include filename="$(find mtrb_description)/urdf/sensors/lidar.urdf.xacro"/>
+
+  <xacro:unless value="$(arg lidar_only)">
+    <xacro:include filename="$(find mtrb_description)/urdf/create3_body.urdf.xacro"/>
+  </xacro:unless>
+  <xacro:if value="$(arg lidar_only)">
+    <link name="base_link"/>
+  </xacro:if>
+
+  <xacro:lidar name="$(arg lidar_frame)" parent_link="base_link">
+    <origin xyz="$(arg lidar_x) $(arg lidar_y) $(arg lidar_z)" rpy="0 0 $(arg lidar_yaw)"/>
+  </xacro:lidar>
+</robot>

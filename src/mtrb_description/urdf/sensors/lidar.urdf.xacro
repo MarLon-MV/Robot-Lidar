@@ -1,0 +1,55 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <!-- LDROBOT LD19 (youyeetoo FHL-LD19).
+       The frame sits on the scan plane, at the rotation center; its name must match the
+       frame_id of the driver. Body: ~54 x 46 x 35 mm, < 50 g. The split between base and
+       head and the scan plane height are approximations (not in the datasheet): measure
+       yours if it matters. -->
+  <xacro:macro name="lidar" params="name:=laser parent_link:=base_link *origin">
+    <xacro:property name="base_side"   value="0.046"/>
+    <xacro:property name="base_height" value="0.016"/>
+    <xacro:property name="head_height" value="0.019"/>
+    <xacro:property name="head_radius" value="0.022"/>   <!-- approx. -->
+    <xacro:property name="scan_plane"  value="0.0245"/>  <!-- approx., from the bottom of the base -->
+    <xacro:property name="mass"        value="0.047"/>
+
+    <joint name="${name}_joint" type="fixed">
+      <xacro:insert_block name="origin"/>
+      <parent link="${parent_link}"/>
+      <child link="${name}"/>
+    </joint>
+
+    <link name="${name}">
+      <visual>
+        <origin xyz="0 0 ${base_height/2 - scan_plane}"/>
+        <geometry>
+          <box size="0.054 ${base_side} ${base_height}"/>
+        </geometry>
+        <material name="${name}_black">
+          <color rgba="0.1 0.1 0.1 1.0"/>
+        </material>
+      </visual>
+      <visual>
+        <origin xyz="0 0 ${base_height + head_height/2 - scan_plane}"/>
+        <geometry>
+          <cylinder radius="${head_radius}" length="${head_height}"/>
+        </geometry>
+        <material name="${name}_black"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 ${(base_height + head_height)/2 - scan_plane}"/>
+        <geometry>
+          <box size="0.054 ${base_side} ${base_height + head_height}"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0 0 ${(base_height + head_height)/2 - scan_plane}"/>
+        <mass value="${mass}"/>
+        <inertia ixx="${mass/12*(base_side**2 + (base_height + head_height)**2)}" ixy="0" ixz="0"
+                 iyy="${mass/12*(base_side**2 + (base_height + head_height)**2)}" iyz="0"
+                 izz="${mass/6*base_side**2}"/>
+      </inertial>
+    </link>
+  </xacro:macro>
+</robot>

@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <!-- Bumper body plus its 5 contact-zone frames. -->
+  <xacro:macro name="bumper" params="name:=bumper parent_link:=base_link visual_mesh collision_mesh
+                                     *origin *inertial">
+    <joint name="${name}_joint" type="fixed">
+      <parent link="${parent_link}"/>
+      <child link="${name}"/>
+      <xacro:insert_block name="origin"/>
+    </joint>
+    <link name="${name}">
+      <visual>
+        <geometry>
+          <mesh filename="${visual_mesh}"/>
+        </geometry>
+      </visual>
+      <collision>
+        <geometry>
+          <mesh filename="${collision_mesh}"/>
+        </geometry>
+      </collision>
+      <xacro:insert_block name="inertial"/>
+    </link>
+
+    <xacro:fixed_frame name="bump_front_center" parent="${parent_link}">
+      <origin xyz="0.175 0 0.039" rpy="0 0 0"/>
+    </xacro:fixed_frame>
+    <xacro:fixed_frame name="bump_front_left" parent="${parent_link}">
+      <origin xyz="0.02345 -0.0875 0.025" rpy="0 0 0.5235985"/>
+    </xacro:fixed_frame>
+    <xacro:fixed_frame name="bump_front_right" parent="${parent_link}">
+      <origin xyz="0.02345 0.0875 0.025" rpy="0 0 -0.5235985"/>
+    </xacro:fixed_frame>
+    <xacro:fixed_frame name="bump_left" parent="${parent_link}">
+      <origin xyz="0.0875 -0.15155 0.025" rpy="0 0 1.047193"/>
+    </xacro:fixed_frame>
+    <xacro:fixed_frame name="bump_right" parent="${parent_link}">
+      <origin xyz="0.0875 0.15155 0.025" rpy="0 0 -1.047193"/>
+    </xacro:fixed_frame>
+  </xacro:macro>
+
+</robot>

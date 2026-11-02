@@ -1,0 +1,16 @@
+# LDROBOT LD19 (youyeetoo FHL-LD19) driver: ldlidar_stl_ros2 / ldlidar_node.
+# Datasheet: UART 230400 bps 8n1, 10 Hz typical, 4.5 kHz samples, 0.02-12 m, DTOF.
+# frame_id and port_name are injected by the launch file (lidar_frame:=, lidar_port:=).
+ldlidar_node:
+  ros__parameters:
+    product_name: LDLiDAR_LD19
+    topic_name: scan                # remapped by the launch file to scan_topic:=
+    frame_id: laser                 # overridden by lidar_frame:=
+    port_name: /dev/ttyUSB0         # overridden by lidar_port:=
+    port_baudrate: 230400           # LD19 only works at 230400
+    laser_scan_dir: true            # true: counterclockwise angles (ROS convention)
+    enable_angle_crop_func: false   # true: blank out [angle_crop_min, angle_crop_max] (deg)
+    angle_crop_min: 135.0
+    angle_crop_max: 225.0
+    range_min: 0.02
+    range_max: 12.0

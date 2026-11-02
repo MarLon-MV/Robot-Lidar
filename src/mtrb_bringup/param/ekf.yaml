@@ -1,0 +1,42 @@
+# robot_localization EKF fusing the Create 3 wheel odometry and IMU.
+# mtrb.launch.py wraps this under the robot namespace (r2); input topics are relative
+# (/r2/odom, /r2/imu) and remapped from the odom_topic/imu_topic launch arguments.
+#
+# Output: /r2/odometry/filtered. publish_tf is false because the Create 3 already
+# publishes odom -> base_link on /r2/tf; two publishers of the same transform would
+# corrupt the TF tree. Override with the ekf_publish_tf launch argument only if the
+# robot's own odom TF is disabled.
+ekf_filter_node:
+  ros__parameters:
+    use_sim_time: false
+    frequency: 30.0
+    two_d_mode: true
+    publish_tf: false
+    publish_acceleration: false
+
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom
+
+    # Config order: x y z | roll pitch yaw | vx vy vz | vroll vpitch vyaw | ax ay az
+    odom0: odom
+    odom0_config: [false, false, false,
+                   false, false, false,
+                   true,  false, false,
+                   false, false, true,
+                   false, false, false]
+    odom0_queue_size: 10
+    odom0_differential: false
+    odom0_relative: false
+
+    imu0: imu
+    imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+    imu0_queue_size: 10
+    imu0_differential: false
+    imu0_relative: false
+    imu0_remove_gravitational_acceleration: false

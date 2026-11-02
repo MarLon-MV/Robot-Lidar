@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <!-- Drive wheel mounted on a wheel-drop slider:
+       parent -> wheel_drop_<name> (prismatic) -> <name>_wheel (continuous). -->
+  <xacro:macro name="wheel_with_wheeldrop" params="name parent_link:=base_link
+                                                   radius:=${3.575*cm2m} width:=${1.5*cm2m} mass:=0.2
+                                                   drop_travel:=${3*cm2m} *origin">
+    <xacro:property name="drop_link"  value="wheel_drop_${name}"/>
+    <xacro:property name="wheel_link" value="${name}_wheel"/>
+
+    <joint name="${drop_link}_joint" type="prismatic">
+      <parent link="${parent_link}"/>
+      <child link="${drop_link}"/>
+      <xacro:insert_block name="origin"/>
+      <axis xyz="0 1 0"/>
+      <limit lower="0" upper="${drop_travel}" effort="0" velocity="0"/>
+    </joint>
+    <link name="${drop_link}"/>
+
+    <joint name="${wheel_link}_joint" type="continuous">
+      <parent link="${drop_link}"/>
+      <child link="${wheel_link}"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <axis xyz="0 0 1"/>
+    </joint>
+    <link name="${wheel_link}">
+      <visual>
+        <geometry>
+          <cylinder length="${width}" radius="${radius}"/>
+        </geometry>
+        <xacro:insert_block name="material_black"/>
+      </visual>
+      <collision>
+        <geometry>
+          <cylinder length="${width}" radius="${radius}"/>
+        </geometry>
+      </collision>
+      <xacro:inertial_cylinder mass="${mass}" radius="${radius}" length="${width}"/>
+    </link>
+  </xacro:macro>
+
+</robot>

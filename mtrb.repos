@@ -1,0 +1,7 @@
+# Third-party sources built inside this workspace (not available as Jazzy apt packages).
+#   vcs import src < mtrb.repos
+repositories:
+  ldlidar_stl_ros2:
+    type: git
+    url: https://github.com/ldrobotSensorTeam/ldlidar_stl_ros2.git
+    version: master
