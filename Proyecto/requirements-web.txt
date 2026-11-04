@@ -1,0 +1,6 @@
+# Python dependencies of mtrb_web_bridge (install in the Pi venv, see README).
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29,<1.0
+
+# Test only (required by fastapi.testclient); not needed on the robot at runtime.
+httpx>=0.27,<1.0

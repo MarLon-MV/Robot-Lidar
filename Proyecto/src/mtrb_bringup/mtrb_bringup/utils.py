@@ -5,6 +5,8 @@ import os
 
 TRUE_STRINGS = ('true', '1', 'yes')
 MODES = ('map', 'mapping')
+WEB_PORT_MIN = 1024  # unprivileged ports only
+WEB_PORT_MAX = 65535
 
 
 def is_true(value):
@@ -43,3 +45,15 @@ def validate_namespace(namespace):
     if not namespace:
         raise ValueError("Argument 'namespace' must not be empty")
     return namespace
+
+
+def validate_web_port(port):
+    """Parse the launch 'web_port' argument and check it is in 1024-65535. Returns an int."""
+    try:
+        value = int(str(port).strip())
+    except ValueError:
+        raise ValueError(f"Argument 'web_port' must be an integer (got '{port}')") from None
+    if not WEB_PORT_MIN <= value <= WEB_PORT_MAX:
+        raise ValueError(
+            f"Argument 'web_port' must be in {WEB_PORT_MIN}-{WEB_PORT_MAX} (got {value})")
+    return value

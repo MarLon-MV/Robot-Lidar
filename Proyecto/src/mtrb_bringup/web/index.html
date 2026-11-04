@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>MTRB - Mapa en vivo</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main id="app">
+    <header id="topbar">
+      <h1>MTRB</h1>
+      <div id="conn" class="badge badge-red" role="status" aria-live="polite">
+        <span class="dot" aria-hidden="true"></span><span id="conn-text">Sin conexión</span>
+      </div>
+      <button id="btn-cancel-nav" type="button" class="btn-stop">Cancelar navegación</button>
+      <button id="btn-token" type="button" class="btn-small">Cambiar token</button>
+    </header>
+
+    <section id="stage" aria-label="Mapa">
+      <canvas id="view" tabindex="0" aria-label="Mapa del robot. Arrastra para desplazar, rueda o pellizco para el zoom."></canvas>
+      <div id="overlay" role="status" aria-live="polite" hidden></div>
+      <div id="controls">
+        <button id="btn-center" type="button">Centrar en robot</button>
+        <label class="toggle"><input id="layer-scan" type="checkbox" checked> Scan</label>
+        <label class="toggle"><input id="layer-plan" type="checkbox" checked> Ruta</label>
+        <label class="toggle"><input id="layer-dock" type="checkbox" checked disabled> Dock</label>
+      </div>
+      <div id="pending-bar" hidden>
+        <span id="pending-text"></span>
+        <label for="yaw-input">Orientación (°)</label>
+        <input id="yaw-input" type="number" min="-180" max="180" step="5" value="0">
+        <button id="btn-confirm" type="button" class="btn-primary">Confirmar objetivo</button>
+        <button id="btn-discard" type="button">Descartar</button>
+      </div>
+    </section>
+
+    <aside id="panel" aria-label="Estado">
+      <div id="commands">
+        <button id="btn-dock" type="button">Volver al dock</button>
+        <span id="dock-confirm" role="group" aria-label="Confirmar regreso al dock" hidden>
+          ¿Enviar el robot al dock?
+          <button id="btn-dock-yes" type="button" class="btn-primary">Sí, volver al dock</button>
+          <button id="btn-dock-no" type="button">No</button>
+        </span>
+        <button id="btn-initpose" type="button" aria-pressed="false" aria-describedby="initpose-hint">Fijar pose inicial</button>
+        <p id="initpose-hint" class="hint"></p>
+        <p id="dock-note" class="hint">Posición del dock no disponible: el servidor no la publica en el estado.</p>
+        <p id="offline-hint" class="hint" hidden></p>
+        <p id="msg" class="msg" role="status" aria-live="polite" hidden></p>
+      </div>
+      <dl>
+        <dt>Modo</dt><dd id="st-mode">-</dd>
+        <dt>Batería</dt><dd id="st-battery">-</dd>
+        <dt>Navegación</dt><dd id="st-nav">-</dd>
+        <dt>Pose</dt><dd id="st-pose">-</dd>
+        <dt>Mapa</dt><dd id="st-map">-</dd>
+      </dl>
+    </aside>
+  </main>
+
+  <div id="login" hidden>
+    <form id="login-form" autocomplete="off">
+      <h2>Acceso al robot</h2>
+      <label for="token-input">Token de acceso</label>
+      <input id="token-input" type="password" required autocomplete="off" spellcheck="false">
+      <p id="login-error" role="alert" hidden></p>
+      <button type="submit">Conectar</button>
+    </form>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

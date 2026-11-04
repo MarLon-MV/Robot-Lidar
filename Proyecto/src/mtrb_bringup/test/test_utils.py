@@ -4,7 +4,8 @@ import math
 import os
 
 from mtrb_bringup.utils import (absolute_path, absolute_topic, is_true, validate_mode,
-                                validate_namespace, yaw_to_quaternion)
+                                validate_namespace, validate_web_port,
+                                yaw_to_quaternion)
 import pytest
 
 
@@ -53,3 +54,15 @@ def test_validate_namespace():
     assert validate_namespace('/r2/') == 'r2'
     with pytest.raises(ValueError):
         validate_namespace(' / ')
+
+
+@pytest.mark.parametrize('value,expected', [
+    ('1024', 1024), ('65535', 65535), ('8080', 8080), (' 8080 ', 8080), (8080, 8080)])
+def test_validate_web_port_accepts_valid_ports(value, expected):
+    assert validate_web_port(value) == expected
+
+
+@pytest.mark.parametrize('value', ['1023', '0', '65536', '-1', '', 'abc', '80.5'])
+def test_validate_web_port_rejects_invalid_ports(value):
+    with pytest.raises(ValueError):
+        validate_web_port(value)

@@ -15,6 +15,8 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
         (os.path.join('share', package_name, 'param'), glob('param/*.yaml')),
         (os.path.join('share', package_name, 'map'), glob('map/*')),
+        # Web UI (static files, may not exist yet): glob() returns [] in that case.
+        (os.path.join('share', package_name, 'web'), glob('web/*.*')),
     ],
     install_requires=['setuptools'],
     extras_require={'test': ['pytest']},
@@ -26,6 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
             'initial_pose_publisher = mtrb_bringup.initial_pose_publisher:main',
+            'mtrb_web_bridge = mtrb_bringup.mtrb_web_bridge:main',
         ],
     },
 )

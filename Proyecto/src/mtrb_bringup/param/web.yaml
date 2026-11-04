@@ -1,0 +1,36 @@
+# Web bridge (FastAPI + rclpy): serves the web UI and the REST/WebSocket API.
+# The token below is a PLACEHOLDER. Never commit a real token: put the real one in
+# param/web.local.yaml (git-ignored) or in the MTRB_WEB_TOKEN environment variable.
+# LAN only: do not expose this port to the internet.
+# Token priority (first non-empty wins):
+#   1. environment variable MTRB_WEB_TOKEN
+#   2. parameter auth.token loaded by the launch (web_params_file)
+#   3. param/web.local.yaml, then param/web.yaml in the installed share (last resort)
+# Quote numeric tokens in YAML (token: "123456"); they are converted to str anyway.
+mtrb_web_bridge:
+  ros__parameters:
+    host: 0.0.0.0
+    port: 8080
+    rates:
+      pose: 10.0                # Hz
+      scan: 5.0                 # Hz
+      status: 1.0               # Hz
+    teleop:
+      max_vx: 0.2               # m/s     INITIAL: tune on the robot
+      max_wz: 0.8               # rad/s   INITIAL: tune on the robot
+      timeout_ms: 300           # ms without a teleop message -> zero Twist
+    scan:
+      max_points: 360
+      min_range: 0.15           # m
+      max_range: 12.0           # m
+    plan:
+      max_points: 200
+    limits:
+      max_clients: 5
+      max_ws_bytes: 4096
+    auth:
+      token: CHANGE-ME-example-token   # placeholder, see header
+    dock:                       # overridden by the launch file (dock_x/dock_y/dock_yaw)
+      x: 0.0                    # m
+      y: 0.0                    # m
+      yaw: 0.0                  # rad

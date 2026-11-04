@@ -34,7 +34,7 @@ from launch_ros.event_handlers import OnStateTransition
 from launch_ros.events.lifecycle import ChangeState
 from lifecycle_msgs.msg import Transition
 from mtrb_bringup.utils import (absolute_path, absolute_topic, is_true, validate_mode,
-                                validate_namespace)
+                                validate_namespace, validate_web_port)
 from nav2_common.launch import RewrittenYaml
 import xacro
 
@@ -55,6 +55,8 @@ class Settings:
     scan_topic: str
     lidar_frame: str
     dock: tuple
+    web: bool
+    web_port: int
 
     @classmethod
     def from_context(cls, context):
@@ -68,7 +70,9 @@ class Settings:
             use_ekf=is_true(get('use_ekf')),
             scan_topic=get('scan_topic'),
             lidar_frame=get('lidar_frame'),
-            dock=(float(get('dock_x')), float(get('dock_y')), float(get('dock_yaw'))))
+            dock=(float(get('dock_x')), float(get('dock_y')), float(get('dock_yaw'))),
+            web=is_true(get('web')),
+            web_port=validate_web_port(get('web_port')))
 
 
 # --- Helpers -------------------------------------------------------------------------
@@ -214,6 +218,18 @@ def _navigation(s, nav_params):
     return nodes + [_lifecycle_manager(s, 'lifecycle_manager_navigation', names)]
 
 
+def _web(s):
+    """Web bridge (FastAPI + rclpy), only with web:=true. Dock pose comes from the launch."""
+    if not s.web:
+        return []
+    x, y, yaw = s.dock
+    return [_node(s, PKG, 'mtrb_web_bridge', 'mtrb_web_bridge',
+                  parameters=[_param_file(s, 'web_params_file'),
+                              {'port': s.web_port,
+                               'mode': s.mode,
+                               'dock.x': x, 'dock.y': y, 'dock.yaw': yaw}])]
+
+
 # --- Entry point ---------------------------------------------------------------------
 
 def _launch_setup(context):
@@ -225,6 +241,7 @@ def _launch_setup(context):
     actions += _localization(s, nav_params) if s.mode == 'map' else _slam(s)
     if is_true(s.get('navigation')):
         actions += _navigation(s, nav_params)
+    actions += _web(s)
     return actions
 
 
@@ -233,6 +250,11 @@ def generate_launch_description():
 
     def param(name):
         return os.path.join(pkg, 'param', name)
+
+    # web.local.yaml (git-ignored, real token) takes precedence over web.yaml.
+    web_params = param('web.local.yaml')
+    if not os.path.isfile(web_params):
+        web_params = param('web.yaml')
 
     arg = DeclareLaunchArgument
     return LaunchDescription([
@@ -287,6 +309,12 @@ def generate_launch_description():
         arg('full_model', default_value='false',
             description='Publish the full Create 3 model too (duplicates its tf_static; '
                         'a visualizer only needs the description topic)'),
+
+        # Web UI / REST API (LAN only). Token: web.local.yaml or MTRB_WEB_TOKEN.
+        arg('web', default_value='false', description='Start mtrb_web_bridge'),
+        arg('web_port', default_value='8080', description='Web bridge port (1024-65535)'),
+        arg('web_params_file', default_value=web_params,
+            description='web.local.yaml if present, else web.yaml'),
 
         OpaqueFunction(function=_launch_setup),
     ])
