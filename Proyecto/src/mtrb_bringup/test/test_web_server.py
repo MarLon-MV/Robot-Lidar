@@ -831,3 +831,802 @@ def test_nav_endpoints_reject_get(path):
     client, nav, _ = _nav_client()
     assert client.get(path, headers=AUTH).status_code == 405
     assert (nav.goals, nav.cancels, nav.poses) == ([], 0, [])
+
+
+# --- teleop and stop over WebSocket / REST (task 18, criteria I-3 and A-4) --------------------
+# SAFETY: the server only forwards teleop/stop to the NavPort (the node holds the decisions).
+# These tests fix WHAT is forwarded, with WHICH client id, and what is never forwarded.
+
+class FakeTeleopNav(FakeNav):
+    """NavPort double with the teleop/stop methods; records every call in order."""
+
+    def __init__(self, teleop_reply=None):
+        super().__init__()
+        self.calls = []                      # ('teleop', id, msg) | ('stop',) | ('disconnect', id)
+        self.teleop_reply = teleop_reply     # None or (code, detail) returned by teleop()
+        self.disconnected = threading.Event()
+
+    def teleop(self, client_id, message):
+        self.calls.append(('teleop', client_id, message))
+        return self.teleop_reply
+
+    def teleop_disconnect(self, client_id):
+        self.calls.append(('disconnect', client_id))
+        self.disconnected.set()
+
+    def stop(self):
+        self.calls.append(('stop',))
+
+    def of(self, kind):
+        return [c for c in self.calls if c[0] == kind]
+
+
+WS_URL = f'/ws?token={TOKEN}'
+TELEOP = {'type': 'teleop', 'vx': 0.1, 'wz': -0.2, 'seq': 1}
+
+
+def _teleop_app(nav='default', max_ws_bytes=4096):
+    nav = FakeTeleopNav() if nav == 'default' else nav
+    return TestClient(create_app(StateStore(), TOKEN, nav_port=nav,
+                                 max_ws_bytes=max_ws_bytes)), nav
+
+
+def _sync(ws):
+    """Round trip that proves every earlier message of this socket was dispatched."""
+    ws.send_text('{"type":"sync-probe"}')
+    reply = json.loads(ws.receive_text())
+    assert reply['code'] == 'unsupported_message'
+
+
+def test_nav_port_base_class_teleop_methods_are_abstract():
+    from mtrb_bringup.web_server import NavPort
+    port = NavPort()
+    with pytest.raises(NotImplementedError):
+        port.teleop(1, {})
+    with pytest.raises(NotImplementedError):
+        port.teleop_disconnect(1)
+    with pytest.raises(NotImplementedError):
+        port.stop()
+
+
+# POST /api/stop
+
+def test_stop_without_token_returns_401_and_does_not_stop():
+    client, nav = _teleop_app()
+    response = client.post('/api/stop')
+    assert response.status_code == 401
+    assert nav.calls == []
+
+
+@pytest.mark.parametrize('header', ['Bearer wrong', 'Bearer ', f'Basic {TOKEN}', TOKEN])
+def test_stop_with_bad_token_returns_401_and_does_not_stop(header):
+    client, nav = _teleop_app()
+    assert client.post('/api/stop', headers=_bearer(header)).status_code == 401
+    assert nav.calls == []
+
+
+def test_stop_with_token_returns_ok_and_stops_exactly_once():
+    client, nav = _teleop_app()
+    response = client.post('/api/stop', headers=AUTH)
+    assert response.status_code == 200
+    assert response.json() == {'ok': True}
+    assert nav.calls == [('stop',)]
+
+
+def test_stop_does_not_cancel_directly_nor_send_goals():
+    client, nav = _teleop_app()
+    client.post('/api/stop', headers=AUTH)
+    assert (nav.cancels, nav.goals, nav.poses) == (0, [], [])
+
+
+def test_stop_without_nav_port_returns_503_nav_unavailable():
+    client = TestClient(create_app(StateStore(), TOKEN))
+    response = client.post('/api/stop', headers=AUTH)
+    assert response.status_code == 503
+    assert response.json()['error'] == 'nav_unavailable'
+
+
+@pytest.mark.parametrize('body', [None, {'x': 'garbage'}, {}, [1, 2, 3]])
+def test_stop_ignores_any_body(body):
+    client, nav = _teleop_app()
+    assert _post(client, '/api/stop', body).status_code == 200
+    assert nav.calls == [('stop',)]
+
+
+def test_stop_ignores_malformed_json_and_oversized_bodies():
+    client, nav = _teleop_app()
+    assert _post(client, '/api/stop', raw='{not json').status_code == 200
+    assert _post(client, '/api/stop', raw='x' * 5000).status_code == 200
+    assert nav.calls == [('stop',), ('stop',)]
+
+
+def test_stop_does_not_need_map_mode_or_a_known_state():
+    store = StateStore()  # no map, no mode
+    nav = FakeTeleopNav()
+    client = TestClient(create_app(store, TOKEN, nav_port=nav))
+    assert client.post('/api/stop', headers=AUTH).status_code == 200
+    assert nav.calls == [('stop',)]
+
+
+def test_stop_in_mapping_mode_is_accepted():
+    client, nav, _ = _nav_client(nav=FakeTeleopNav(), mode='mapping', grid=None)
+    assert client.post('/api/stop', headers=AUTH).status_code == 200
+    assert nav.calls == [('stop',)]
+
+
+def test_stop_is_repeatable_every_call_reaches_the_port():
+    client, nav = _teleop_app()
+    for _ in range(10):
+        assert client.post('/api/stop', headers=AUTH).status_code == 200
+    assert nav.calls == [('stop',)] * 10
+
+
+def test_stop_rejects_get():
+    client, nav = _teleop_app()
+    assert client.get('/api/stop', headers=AUTH).status_code == 405
+    assert nav.calls == []
+
+
+# WebSocket stop
+
+def test_ws_stop_calls_the_port_and_sends_no_reply():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text('{"type":"stop"}')
+        _sync(ws)
+    assert nav.of('stop') == [('stop',)]
+
+
+def test_ws_stop_is_not_rate_limited_by_the_server():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        for _ in range(60):
+            ws.send_text('{"type":"stop"}')
+        _sync(ws)
+    assert len(nav.of('stop')) == 60
+
+
+def test_ws_stop_from_another_client_is_dispatched_between_the_owners_teleops():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as owner, \
+            client.websocket_connect(WS_URL) as other:
+        owner.send_text(json.dumps(TELEOP))
+        other.send_text('{"type":"stop"}')
+        _sync(other)
+        owner.send_text(json.dumps({**TELEOP, 'seq': 2}))
+        _sync(owner)
+    kinds = [c[0] for c in nav.calls if c[0] != 'disconnect']
+    assert kinds.count('stop') == 1
+    assert kinds.count('teleop') == 2
+
+
+def test_ws_stop_ignores_extra_fields_and_never_reaches_teleop():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text('{"type":"stop","vx":1,"seq":-5,"junk":[1,2]}')
+        _sync(ws)
+    assert nav.of('stop') == [('stop',)]
+    assert nav.of('teleop') == []
+
+
+def test_ws_stop_without_nav_port_answers_stop_unavailable():
+    client = TestClient(create_app(StateStore(), TOKEN))
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text('{"type":"stop"}')
+        reply = json.loads(ws.receive_text())
+    assert reply['type'] == 'error'
+    assert reply['code'] == 'stop_unavailable'
+    assert 'physical stop' in reply['detail']
+
+
+def test_ws_teleop_without_nav_port_is_rejected():
+    client = TestClient(create_app(StateStore(), TOKEN))
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(json.dumps(TELEOP))
+        reply = json.loads(ws.receive_text())
+    assert reply['type'] == 'error'
+    assert reply['code'] == 'teleop_rejected'
+
+
+# WebSocket teleop dispatch
+
+def test_ws_teleop_is_forwarded_to_the_port_with_the_whole_message():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(json.dumps(TELEOP))
+        _sync(ws)
+    calls = nav.of('teleop')
+    assert len(calls) == 1
+    assert calls[0][2] == TELEOP
+    assert nav.of('stop') == []
+
+
+def test_ws_teleop_accepted_gets_no_reply():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(json.dumps(TELEOP))
+        _sync(ws)  # the first reply is the probe's: teleop produced none
+
+
+def test_ws_teleop_error_of_the_port_is_sent_to_that_client_only():
+    nav = FakeTeleopNav(teleop_reply=('teleop_rejected', 'Another client is controlling'))
+    client, _ = _teleop_app(nav)
+    with client, client.websocket_connect(WS_URL) as sender, \
+            client.websocket_connect(WS_URL) as bystander:
+        sender.send_text(json.dumps(TELEOP))
+        reply = json.loads(sender.receive_text())
+        _sync(bystander)  # the bystander only gets its own probe reply
+    assert reply == {'type': 'error', 'code': 'teleop_rejected',
+                     'detail': 'Another client is controlling'}
+
+
+def test_ws_teleop_messages_reach_the_port_in_order():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        for seq in range(1, 6):
+            ws.send_text(json.dumps({**TELEOP, 'seq': seq}))
+        _sync(ws)
+    assert [c[2]['seq'] for c in nav.of('teleop')] == [1, 2, 3, 4, 5]
+
+
+def test_ws_stop_after_teleop_keeps_the_order_teleop_then_stop():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(json.dumps(TELEOP))
+        ws.send_text('{"type":"stop"}')
+        _sync(ws)
+    assert [c[0] for c in nav.calls if c[0] != 'disconnect'] == ['teleop', 'stop']
+
+
+def test_ws_teleop_and_stop_use_the_same_client_id_as_the_disconnect():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(json.dumps(TELEOP))
+        _sync(ws)
+    assert nav.disconnected.wait(timeout=3), 'teleop_disconnect was not called'
+    assert nav.of('teleop')[0][1] == nav.of('disconnect')[0][1]
+
+
+def test_each_connection_gets_a_different_client_id():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as first, \
+            client.websocket_connect(WS_URL) as second:
+        first.send_text(json.dumps(TELEOP))
+        _sync(first)
+        second.send_text(json.dumps(TELEOP))
+        _sync(second)
+    ids = [c[1] for c in nav.of('teleop')]
+    assert len(ids) == 2 and ids[0] != ids[1]
+
+
+def test_client_ids_are_not_reused_by_later_connections():
+    client, nav = _teleop_app()
+    with client:
+        for _ in range(3):
+            with client.websocket_connect(WS_URL) as ws:
+                ws.send_text(json.dumps(TELEOP))
+                _sync(ws)
+    ids = [c[1] for c in nav.of('teleop')]
+    assert len(set(ids)) == 3
+
+
+def test_client_id_is_never_taken_from_the_message():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(json.dumps({**TELEOP, 'client_id': 'spoofed', 'id': 'spoofed'}))
+        _sync(ws)
+    client_id = nav.of('teleop')[0][1]
+    assert client_id != 'spoofed' and isinstance(client_id, int)
+
+
+# WebSocket close -> teleop_disconnect
+
+def test_closing_the_websocket_calls_teleop_disconnect_once():
+    client, nav = _teleop_app()
+    with client:
+        with client.websocket_connect(WS_URL) as ws:
+            ws.send_text(json.dumps(TELEOP))
+            _sync(ws)
+        assert nav.disconnected.wait(timeout=3), 'teleop_disconnect was not called'
+    assert len(nav.of('disconnect')) == 1
+
+
+def test_a_connection_that_never_sent_teleop_also_reports_its_disconnect():
+    client, nav = _teleop_app()
+    with client:
+        with client.websocket_connect(WS_URL):
+            pass
+        assert nav.disconnected.wait(timeout=3)
+    assert nav.of('teleop') == []
+    assert len(nav.of('disconnect')) == 1
+
+
+def test_oversized_message_closes_with_1009_and_still_reports_the_disconnect():
+    client, nav = _teleop_app()
+    from starlette.websockets import WebSocketDisconnect
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(json.dumps({**TELEOP, 'pad': 'x' * 5000}))
+        with pytest.raises(WebSocketDisconnect) as info:
+            ws.receive_text()
+    assert info.value.code == 1009
+    assert nav.disconnected.wait(timeout=3)
+    assert nav.of('teleop') == []
+
+
+def test_rejected_token_never_reaches_the_port():
+    client, nav = _teleop_app()
+    _expect_closed(client, '/ws?token=wrong')
+    assert nav.calls == []
+
+
+# size limit, invalid JSON
+
+def _padded_teleop(total_bytes):
+    base = json.dumps({**TELEOP, 'pad': ''}, separators=(',', ':'))
+    return json.dumps({**TELEOP, 'pad': 'x' * (total_bytes - len(base))},
+                      separators=(',', ':'))
+
+
+def test_message_of_exactly_4096_bytes_is_still_dispatched():
+    text = _padded_teleop(4096)
+    assert len(text.encode()) == 4096
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(text)
+        _sync(ws)
+    assert len(nav.of('teleop')) == 1
+
+
+def test_message_of_4097_bytes_closes_with_1009_without_dispatch():
+    text = _padded_teleop(4097)
+    assert len(text.encode()) == 4097
+    client, nav = _teleop_app()
+    from starlette.websockets import WebSocketDisconnect
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(text)
+        with pytest.raises(WebSocketDisconnect) as info:
+            ws.receive_text()
+    assert info.value.code == 1009
+    assert nav.of('teleop') == []
+
+
+def test_multibyte_text_is_measured_in_bytes_not_characters():
+    # ~2100 characters but more than 4096 bytes in UTF-8
+    text = json.dumps({**TELEOP, 'pad': 'ñ' * 2100}, ensure_ascii=False)
+    assert len(text) < 4096 < len(text.encode())
+    client, nav = _teleop_app()
+    from starlette.websockets import WebSocketDisconnect
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(text)
+        with pytest.raises(WebSocketDisconnect) as info:
+            ws.receive_text()
+    assert info.value.code == 1009
+
+
+def test_binary_message_larger_than_the_limit_closes_with_1009():
+    client, nav = _teleop_app()
+    from starlette.websockets import WebSocketDisconnect
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_bytes(b'\x00' * 4097)
+        with pytest.raises(WebSocketDisconnect) as info:
+            ws.receive_text()
+    assert info.value.code == 1009
+    assert nav.of('stop') == [] and nav.of('teleop') == []
+
+
+@pytest.mark.parametrize('raw', [
+    '{"type":"teleop","vx":NaN,"wz":0,"seq":1}',
+    '{"type":"teleop","vx":0,"wz":Infinity,"seq":1}',
+    '{"type":"teleop","vx":0,"wz":-Infinity,"seq":1}',
+    '{"type":"teleop","vx":0,"wz":0,"seq":NaN}',
+    '{not json', '', '   ', 'null', '[]', '[{"type":"stop"}]', '"stop"', '5', 'true',
+    '{"type":"teleop"', '{"type":"stop"}}',
+    '{"type":"Stop"}', '{"type":"TELEOP"}', '{"type":" stop"}', '{"type":null}',
+    '{"type":["stop"]}', '{"type":1}', '{}', '{"kind":"stop"}'])
+def test_ws_invalid_json_or_unknown_type_is_unsupported_message_and_never_dispatched(raw):
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(raw)
+        reply = json.loads(ws.receive_text())
+    assert reply['type'] == 'error'
+    assert reply['code'] == 'unsupported_message'
+    assert nav.of('teleop') == [] and nav.of('stop') == []
+
+
+def test_ws_binary_frame_is_unsupported_message_and_never_dispatched():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_bytes(b'{"type":"stop"}')
+        reply = json.loads(ws.receive_text())
+    assert reply['code'] == 'unsupported_message'
+    assert nav.of('stop') == []
+
+
+def test_ws_deeply_nested_json_does_not_crash_the_receiver():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text('[' * 1500 + ']' * 1500)
+        reply = json.loads(ws.receive_text())
+        ws.send_text('{"type":"stop"}')
+        _sync(ws)
+    assert reply['code'] == 'unsupported_message'
+    assert nav.of('stop') == [('stop',)]
+
+
+def test_connection_keeps_working_after_invalid_messages():
+    client, nav = _teleop_app()
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text('{broken')
+        _sync(ws)
+        ws.send_text('{"type":"stop"}')
+        _sync(ws)
+    assert nav.of('stop') == [('stop',)]
+
+
+# the server never logs teleop content
+
+def test_server_source_never_logs():
+    import inspect
+    import re
+    from mtrb_bringup import web_server
+    source = inspect.getsource(web_server)
+    assert not re.search(r'\bimport logging\b|\bgetLogger\b|\bprint\(|\blogger\b|'
+                         r'\bwarnings\.warn\b', source)
+
+
+def test_dispatch_code_does_not_reference_logging_of_messages():
+    import inspect
+    from mtrb_bringup import web_server
+    for func in (web_server._handle_client_message, web_server._receive_loop,
+                 web_server._parse_ws_text):
+        body = inspect.getsource(func).lower()
+        assert 'logg' not in body.replace('never logged', '')
+        assert 'print(' not in body
+
+
+def test_server_emits_no_log_records_while_handling_teleop_and_stop(caplog):
+    import logging
+    client, nav = _teleop_app(FakeTeleopNav(teleop_reply=('teleop_rejected', 'x')))
+    with caplog.at_level(logging.DEBUG):
+        with client, client.websocket_connect(WS_URL) as ws:
+            ws.send_text(json.dumps({**TELEOP, 'vx': 0.123456789, 'seq': 987654321}))
+            ws.receive_text()
+            ws.send_text('{"type":"stop"}')
+            _sync(ws)
+    ours = [r for r in caplog.records if r.name.startswith('mtrb_bringup')]
+    assert ours == []
+    assert '0.123456789' not in caplog.text and '987654321' not in caplog.text
+
+
+# --- phase 4: huge integers and hostile Content-Length (never a 500) -------------------------
+
+HUGE = 10 ** 400
+
+
+@pytest.mark.parametrize('path', ['/api/goal', '/api/initialpose'])
+@pytest.mark.parametrize('field', ['x', 'y', 'yaw'])
+@pytest.mark.parametrize('huge', [HUGE, -HUGE])
+def test_huge_integer_in_the_pose_returns_400_invalid_body_never_500(path, field, huge):
+    client, nav, _ = _nav_client()
+    body = {'x': 3.5, 'y': 2.5, 'yaw': 1.0, field: huge}
+    response = _post(client, path, raw=json.dumps(body).encode())
+    assert response.status_code == 400
+    assert response.json()['error'] == 'invalid_body'
+    assert (nav.goals, nav.poses) == ([], [])
+
+
+def test_huge_integer_goal_in_a_map_with_a_huge_origin_is_400_not_500():
+    # The goal itself is fine; the map metadata overflows: still a clean refusal.
+    client, nav, _ = _nav_client(grid=_grid(origin_x=HUGE))
+    response = _post(client, '/api/goal', GOOD)
+    assert response.status_code == 400
+    assert response.json()['error'] == 'invalid_goal'
+    assert nav.goals == []
+
+
+def test_dock_with_a_huge_integer_in_the_map_metadata_is_400_not_500():
+    client, nav, _ = _nav_client(grid=_grid(resolution=HUGE, width=HUGE))
+    response = _post(client, '/api/dock')
+    assert response.status_code == 400
+    assert response.json()['error'] == 'invalid_goal'
+    assert nav.goals == []
+
+
+def test_dock_configured_with_a_huge_integer_is_refused_not_a_500():
+    client, nav, _ = _nav_client(dock=(HUGE, 0.0, 0.0))
+    response = _post(client, '/api/dock')
+    assert response.status_code == 400
+    assert response.json()['error'] == 'invalid_goal'
+    assert nav.goals == []
+
+
+def test_the_server_keeps_working_after_a_huge_integer_request():
+    client, nav, _ = _nav_client()
+    assert _post(client, '/api/goal', raw=json.dumps({'x': HUGE, 'y': 1, 'yaw': 0}).encode(
+        )).status_code == 400
+    assert _post(client, '/api/goal', GOOD).status_code == 200
+    assert len(nav.goals) == 1
+
+
+def _post_with_content_length(client, declared, body, path='/api/goal'):
+    return client.post(path, content=body, headers={
+        **AUTH, 'Content-Type': 'application/json', 'Content-Length': declared})
+
+
+VALID_BODY = b'{"x": 3.5, "y": 2.5, "yaw": 1.0}'
+OVERSIZED_BODY = VALID_BODY + b' ' * 2000
+
+
+@pytest.mark.parametrize('declared', [b'\xb2', b'\xb2\xb2\xb2', b'\xff', b'1\xb2'])
+def test_non_ascii_content_length_with_an_oversized_body_returns_400_body_too_large(declared):
+    client, nav, _ = _nav_client()
+    response = _post_with_content_length(client, declared, OVERSIZED_BODY)
+    assert response.status_code == 400
+    assert response.json()['error'] == 'body_too_large'
+    assert nav.goals == []
+
+
+@pytest.mark.parametrize('declared', [b'\xb2', b'\xff', b'1\xb2'])
+def test_non_ascii_content_length_never_causes_a_500(declared):
+    client, nav, _ = _nav_client()
+    response = _post_with_content_length(client, declared, VALID_BODY)
+    assert response.status_code < 500
+    assert response.status_code in (200, 400)
+
+
+@pytest.mark.parametrize('digits', [4301, 5000, 20000])
+@pytest.mark.parametrize('body', [VALID_BODY, OVERSIZED_BODY])
+def test_content_length_of_more_than_4300_digits_returns_400_body_too_large(digits, body):
+    client, nav, _ = _nav_client()
+    response = _post_with_content_length(client, '9' * digits, body)
+    assert response.status_code == 400
+    assert response.json()['error'] == 'body_too_large'
+    assert nav.goals == []
+
+
+@pytest.mark.parametrize('declared', ['1025', '99999999', '4300' + '0' * 10])
+def test_declared_content_length_over_the_limit_returns_400_body_too_large(declared):
+    client, nav, _ = _nav_client()
+    response = _post_with_content_length(client, declared, VALID_BODY)
+    assert response.status_code == 400
+    assert response.json()['error'] == 'body_too_large'
+    assert nav.goals == []
+
+
+def test_the_server_keeps_working_after_hostile_content_length_requests():
+    client, nav, _ = _nav_client()
+    _post_with_content_length(client, b'\xb2', OVERSIZED_BODY)
+    _post_with_content_length(client, '9' * 5000, VALID_BODY)
+    assert _post(client, '/api/goal', GOOD).status_code == 200
+
+
+class GateNav(FakeTeleopNav):
+    """FakeTeleopNav whose teleop() is decided by the REAL TeleopGate (clock fixed)."""
+
+    def __init__(self):
+        super().__init__()
+        from mtrb_bringup.web_utils import TeleopGate
+        self.gate = TeleopGate(0.2, 0.8, 0.3, lambda: 0.0)
+
+    def teleop(self, client_id, message):
+        self.calls.append(('teleop', client_id, message))
+        return self.gate.on_teleop(client_id, message, False).error
+
+
+@pytest.mark.parametrize('field', ['vx', 'wz', 'seq'])
+def test_ws_teleop_with_a_huge_integer_gets_an_error_and_the_server_stays_up(field):
+    nav = GateNav()
+    client = TestClient(create_app(StateStore(), TOKEN, nav_port=nav))
+    message = dict(TELEOP, **{field: HUGE})
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(json.dumps(message))
+        reply = json.loads(ws.receive_text())
+        assert reply['code'] in ('invalid_teleop', 'unsupported_message')
+        _sync(ws)                                    # the socket and the loop are alive
+    with client, client.websocket_connect(WS_URL) as ws:    # and the server accepts others
+        ws.send_text(json.dumps(dict(TELEOP, seq=0)))
+        _sync(ws)
+    assert nav.of('teleop')[-1][2]['seq'] == 0
+
+
+def test_ws_teleop_with_a_huge_integer_never_publishes_anything_through_the_gate():
+    nav = GateNav()
+    client = TestClient(create_app(StateStore(), TOKEN, nav_port=nav))
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(json.dumps(dict(TELEOP, vx=HUGE)))
+        assert json.loads(ws.receive_text())['code'] == 'invalid_teleop'
+    assert nav.gate.owner_age_s is None              # nobody took the lease
+
+
+def test_ws_message_with_an_integer_over_4300_digits_is_unsupported_not_a_crash():
+    client, nav = _teleop_app(max_ws_bytes=16384)
+    text = '{"type":"teleop","vx":1' + '0' * 5000 + ',"wz":0,"seq":1}'
+    with client, client.websocket_connect(WS_URL) as ws:
+        ws.send_text(text)
+        reply = json.loads(ws.receive_text())
+        assert reply['code'] == 'unsupported_message'
+        assert nav.of('teleop') == []                # never reached the node
+        _sync(ws)
+
+
+# --- security headers on every HTTP response (phase 5 hardening) ---------------------------
+
+EXPECTED_CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; "
+                "connect-src 'self' ws: wss:; img-src 'self' data: blob:; "
+                "frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+EXPECTED_SECURITY_HEADERS = {
+    'x-frame-options': 'DENY',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
+    'content-security-policy': EXPECTED_CSP,
+}
+INTERNAL_SECRET = '/home/pi/secret_dir/internal.py LEAK-42'
+
+
+class _FileMapPort:
+    """MapPort double that writes a tiny map, so a first save succeeds."""
+
+    def ready(self):
+        return True
+
+    def save_map(self, base_path, timeout_s):
+        for ext in ('.yaml', '.pgm'):
+            with open(base_path + ext, 'wb') as handle:
+                handle.write(b'x')
+        return True
+
+    def serialize_posegraph(self, base_path, timeout_s):
+        return False
+
+
+class _ExplodingStore(StateStore):
+    """StateStore whose snapshot raises an unexpected error (provokes the generic 500)."""
+
+    def snapshot(self):
+        raise RuntimeError(INTERNAL_SECRET)
+
+
+def _assert_security_headers(response):
+    for name, value in EXPECTED_SECURITY_HEADERS.items():
+        assert response.headers.get(name) == value, (response.status_code, name)
+
+
+def test_the_csp_constant_is_exactly_the_documented_policy():
+    from mtrb_bringup.web_server import SECURITY_HEADERS
+    assert {k.lower(): v for k, v in SECURITY_HEADERS.items()} == EXPECTED_SECURITY_HEADERS
+
+
+def _map_client(tmp_path, clock, mode='mapping', min_free_mb=0):
+    import os
+    from unittest import mock
+    from mtrb_bringup import web_server
+    store = StateStore()
+    store.update(mode=mode)
+    real_saver = web_server.MapSaver
+
+    def saver(*args, **kwargs):
+        return real_saver(*args, clock=clock, **kwargs)
+
+    with mock.patch.object(web_server, 'MapSaver', saver):
+        app = create_app(store, TOKEN, map_port=_FileMapPort(),
+                         map_dir=os.path.join(os.path.realpath(str(tmp_path)), 'maps'),
+                         map_min_free_mb=min_free_mb, map_min_interval_s=5.0)
+    return TestClient(app)
+
+
+def test_security_headers_on_a_200(client):
+    response = client.get('/api/state', headers=AUTH)
+    assert response.status_code == 200
+    _assert_security_headers(response)
+
+
+def test_security_headers_on_the_served_static_files(tmp_path):
+    for name in ('index.html', 'app.js', 'style.css'):
+        (tmp_path / name).write_text('x')
+    client = TestClient(create_app(StateStore(), TOKEN, str(tmp_path)))
+    for path in ('/', '/app.js', '/style.css'):
+        response = client.get(path)
+        assert response.status_code == 200
+        _assert_security_headers(response)
+
+
+def test_security_headers_on_a_401(client):
+    response = client.get('/api/state')
+    assert response.status_code == 401
+    _assert_security_headers(response)
+
+
+def test_security_headers_on_a_404_of_an_unknown_route(client):
+    response = client.get('/no/such/route', headers=AUTH)
+    assert response.status_code == 404
+    _assert_security_headers(response)
+
+
+def test_security_headers_on_the_404_of_a_missing_web_ui(client):
+    response = client.get('/')
+    assert response.status_code == 404
+    _assert_security_headers(response)
+
+
+def test_security_headers_on_a_405(client):
+    response = client.get('/api/goal', headers=AUTH)
+    assert response.status_code == 405
+    _assert_security_headers(response)
+
+
+def test_security_headers_on_a_400(client):
+    response = client.post('/api/goal', json={'x': 'bad'}, headers=AUTH)
+    assert response.status_code == 400
+    _assert_security_headers(response)
+
+
+def test_security_headers_on_a_409(tmp_path):
+    client = _map_client(tmp_path, lambda: 0.0, mode='map')
+    response = client.post('/api/map/save', json={'name': 'lab'}, headers=AUTH)
+    assert (response.status_code, response.json()['error']) == (409, 'wrong_mode')
+    _assert_security_headers(response)
+
+
+def test_security_headers_on_a_429(tmp_path):
+    clock = [100.0]
+    client = _map_client(tmp_path, lambda: clock[0])
+    assert client.post('/api/map/save', json={'name': 'a'}, headers=AUTH).status_code == 200
+    response = client.post('/api/map/save', json={'name': 'b'}, headers=AUTH)
+    assert (response.status_code, response.json()['error']) == (429, 'save_rate_limited')
+    _assert_security_headers(response)
+
+
+def test_security_headers_on_a_503(client):
+    response = client.post('/api/stop', headers=AUTH)
+    assert response.status_code == 503
+    _assert_security_headers(response)
+
+
+def test_security_headers_on_a_507(tmp_path, monkeypatch):
+    from collections import namedtuple
+    from mtrb_bringup import web_server
+    usage = namedtuple('usage', 'total used free')
+    monkeypatch.setattr(web_server.shutil, 'disk_usage', lambda path: usage(1, 1, 0))
+    client = _map_client(tmp_path, lambda: 0.0, min_free_mb=1)
+    response = client.post('/api/map/save', json={'name': 'a'}, headers=AUTH)
+    assert (response.status_code, response.json()['error']) == (507, 'insufficient_storage')
+    _assert_security_headers(response)
+
+
+def test_security_headers_on_the_generic_500_without_leaking_anything():
+    client = TestClient(create_app(_ExplodingStore(), TOKEN), raise_server_exceptions=False)
+    response = client.get('/api/state', headers=AUTH)
+    assert response.status_code == 500
+    assert response.json() == {'error': 'internal_error', 'detail': 'Internal error'}
+    _assert_security_headers(response)
+    everything = response.text + str(dict(response.headers))
+    for forbidden in ('LEAK-42', '/home/pi', 'secret_dir', 'internal.py', 'Traceback',
+                      'RuntimeError', 'web_server', '.py'):
+        assert forbidden not in everything, forbidden
+
+
+def test_the_generic_500_is_json_and_the_server_keeps_answering_afterwards():
+    client = TestClient(create_app(_ExplodingStore(), TOKEN), raise_server_exceptions=False)
+    assert client.get('/api/state', headers=AUTH).status_code == 500
+    assert client.get('/api/state', headers=AUTH).status_code == 500
+    assert client.get('/api/state').status_code == 401        # auth still checked first
+    assert client.post('/api/stop', headers=AUTH).status_code == 503
+
+
+def test_security_headers_are_not_overridable_by_the_request(client):
+    response = client.get('/api/state', headers={**AUTH, 'X-Frame-Options': 'ALLOWALL'})
+    assert response.headers['x-frame-options'] == 'DENY'
+
+
+# --- is_placeholder_token: case-insensitive after strip -------------------------------------
+
+@pytest.mark.parametrize('token', ['change-me-x', '  Change-Me', 'CHANGE-ME',
+                                   'cHaNgE-mE-xxxxxxxxxxxxxxxx', 'change-me', '\tchange-me-1\n'])
+def test_placeholder_tokens_are_detected_whatever_the_case_and_the_outer_spaces(token):
+    assert is_placeholder_token(token) is True
+
+
+@pytest.mark.parametrize('token', ['changeme', 'xCHANGE-ME', '', '   ', 'CHANGE_ME',
+                                   'CHANGE ME', 'a-change-me-token'])
+def test_other_tokens_are_not_placeholders(token):
+    assert is_placeholder_token(token) is False

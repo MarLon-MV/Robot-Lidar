@@ -1,8 +1,10 @@
 """ROS 2 node that hosts the web server (FastAPI + uvicorn) next to rclpy."""
 
+import functools
 import hashlib
 import math
 import os
+import re
 import socket
 import threading
 import time
@@ -11,26 +13,34 @@ import uuid
 from action_msgs.msg import GoalStatus
 from action_msgs.srv import CancelGoal
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+from lifecycle_msgs.srv import GetState
 from mtrb_bringup.utils import MODES, validate_web_port
 from mtrb_bringup.web_server import (
-    BroadcastHub, create_app, is_placeholder_token, json_message, NavBusyError, NavPort,
-    NavUnavailableError, resolve_token, StateStore, TOKEN_ENV_VAR)
+    BroadcastHub, create_app, is_placeholder_token, json_message, MapPort, NavBusyError,
+    NavPort, NavUnavailableError, resolve_token, SlamTimeoutError, SlamUnavailableError,
+    StateStore, TOKEN_ENV_VAR)
 from mtrb_bringup.web_utils import (
     downsample_scan, occupancy_to_bytes, pack_map_binary, quaternion_from_yaw,
-    scan_to_map_points, simplify_path, yaw_from_quaternion)
+    scan_to_map_points, simplify_path, TELEOP_PUBLISH, TELEOP_ZERO, TELEOP_ZERO_BURST,
+    TeleopAction, TeleopGate, yaw_from_quaternion)
 from nav2_msgs.action import NavigateToPose
-from nav_msgs.msg import OccupancyGrid, Path
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rcl_interfaces.msg import ParameterDescriptor
 import rclpy
 from rclpy.action import ActionClient
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.clock import Clock, ClockType
 from rclpy.duration import Duration
+from rclpy.exceptions import InvalidParameterTypeException, InvalidParameterValueException
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy, qos_profile_sensor_data, QoSProfile, ReliabilityPolicy)
 from rclpy.time import Time
 from sensor_msgs.msg import BatteryState, LaserScan
+from slam_toolbox.srv import SaveMap, SerializePoseGraph
+from std_msgs.msg import String
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -56,6 +66,7 @@ NAV_SERVER_LOST_TIMEOUT_S = 3.0  # an active goal whose action server vanished i
 NAV_WATCHDOG_PERIOD_S = 0.5
 NAV_CANCEL_RETRY_S = 1.0         # min time between two cancel requests of the same goal
 MAX_ORPHAN_GOALS = 8             # bound of goals kept until Nav2 confirms they ended
+STOP_CANCEL_ALL_MIN_PERIOD_S = 0.5  # min time between cancel-all requests armed by stops
 CANCEL_ALL_WARN_PERIOD_S = 10.0  # min time between 'service not ready' warnings
 MAX_CANCEL_ALL_ATTEMPTS = 5      # bound of cancel-all requests per release/cancel event
 # action_msgs/srv/CancelGoal return codes (stable values of the ROS 2 interface).
@@ -68,6 +79,32 @@ CANCEL_ERROR_GOAL_TERMINATED = 3
 INITIAL_COVARIANCE_XY = 0.25
 INITIAL_COVARIANCE_YAW = 0.0685
 DOCK_LIMIT = 10000.0            # sanity bound of the configured dock pose (m / rad)
+# Teleop. Hard ceilings = Create 3 limits (0.46 m/s, 1.9 rad/s): a parameter above them is a
+# configuration error, never silently accepted. Watchdog period << teleop.timeout_ms.
+TELEOP_WATCHDOG_PERIOD_S = 0.02
+TELEOP_HARD_MAX_VX_MPS = 0.46
+TELEOP_HARD_MAX_WZ_RADPS = 1.9
+TELEOP_MIN_TIMEOUT_MS = 50
+TELEOP_MAX_TIMEOUT_MS = 1000
+MS_PER_S = 1000.0
+# Status: lifecycle polling (Hz) is deliberately slow; it must never load the Pi or the executor.
+LIFECYCLE_MAX_RATE_HZ = 0.5
+LIFECYCLE_MIN_RATE_HZ = 0.05
+LIFECYCLE_MAX_NODES = 16
+NODE_NAME_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,63}')
+# State labels of lifecycle_msgs/State (primary and transition states). Anything else is
+# reported as 'unknown'; a missing service is 'unavailable'.
+LIFECYCLE_LABELS = frozenset((
+    'unknown', 'unconfigured', 'inactive', 'active', 'finalized', 'configuring',
+    'cleaningup', 'shuttingdown', 'activating', 'deactivating', 'errorprocessing'))
+STATE_UNKNOWN = 'unknown'
+STATE_UNAVAILABLE = 'unavailable'
+# Localization node that the launch starts in each mode (mtrb.launch.py _localization/_slam).
+MODE_NODES = {'map': ('map_server', 'amcl'), 'mapping': ('slam_toolbox',)}
+# slam_toolbox services (relative: /<ns>/slam_toolbox/...; both created by the node
+# `slam_toolbox` with these names in slam_toolbox_common.cpp / map_saver.cpp, Jazzy).
+SAVE_MAP_SERVICE = 'slam_toolbox/save_map'
+SERIALIZE_MAP_SERVICE = 'slam_toolbox/serialize_map'
 
 NAV_IDLE = 'idle'
 NAV_ACTIVE = 'active'
@@ -88,6 +125,7 @@ PARAMETERS = (
     ('teleop.max_vx', 0.2),           # m/s
     ('teleop.max_wz', 0.8),           # rad/s
     ('teleop.timeout_ms', 300),       # ms
+    ('teleop.enabled', True),
     ('mode', ''),                     # injected by the launch ('map' | 'mapping')
     ('scan.max_points', 360),
     ('scan.min_range', 0.15),         # m
@@ -99,26 +137,48 @@ PARAMETERS = (
     ('dock.x', 0.0),                  # m
     ('dock.y', 0.0),                  # m
     ('dock.yaw', 0.0),                # rad
+    ('rates.lifecycle', 0.5),         # Hz, at most LIFECYCLE_MAX_RATE_HZ
+    ('status.nodes', ['controller_server', 'planner_server', 'bt_navigator',
+                      'behavior_server', 'velocity_smoother']),
+    ('map_dir', ''),                  # '' = ~/mtrb_maps
+    ('auth.allow_example_token', False),  # development only; loopback host required
+    ('maps.min_free_mb', 200),        # MB of free disk required to save a map
+    ('maps.min_interval_s', 5.0),     # s between two map saves
 )
+
+
+# Parameters that accept both int and float from YAML (e.g. `teleop.max_vx: 1`): declared
+# with dynamic typing so rclpy does not raise at declaration; _number() validates the type.
+# `auth.token` is dynamic too (YAML may deliver a numeric token) and `status.nodes` so that an
+# empty list is not rejected by the static typing. Every other parameter keeps static typing:
+# a wrong type is reported as ConfigError by _declare_parameters.
+DYNAMIC_PARAMETERS = frozenset((
+    'auth.token', 'rates.pose', 'rates.scan', 'rates.status', 'rates.lifecycle',
+    'teleop.max_vx', 'teleop.max_wz', 'scan.min_range', 'scan.max_range',
+    'dock.x', 'dock.y', 'dock.yaw', 'maps.min_free_mb', 'maps.min_interval_s',
+    'status.nodes'))
+
+TOKEN_MIN_LENGTH = 16                       # characters
+# uvicorn is bound through an AF_INET socket (start_server), so in practice only IPv4 hosts
+# can be listened on; '::1' is accepted here but cannot be bound (the bind fails: ConfigError).
+LOOPBACK_HOSTS = ('127.0.0.1', '::1', 'localhost')
+DEFAULT_MAP_DIR = '~/mtrb_maps'
 
 
 class ConfigError(Exception):
     """Invalid or missing configuration: the node must not start."""
 
 
-class MtrbWebBridge(Node, NavPort):
+class MtrbWebBridge(Node, NavPort, MapPort):
     """Hold the shared StateStore, the NavPort implementation and the web server thread."""
+
+    _teleop_gate = None  # TeleopGate; None (never configured) = teleop refused, fail closed
+    _odom_rx_s = None    # ROS time of the last odometry message (None = never received)
 
     def __init__(self):
         """Declare parameters, validate them and prepare (not start) the web app."""
         super().__init__('mtrb_web_bridge')
-        for name, default in PARAMETERS:
-            if name == 'auth.token':
-                # Dynamic typing: YAML may deliver a numeric token as int/float.
-                self.declare_parameter(
-                    name, default, ParameterDescriptor(dynamic_typing=True))
-            else:
-                self.declare_parameter(name, default)
+        self._declare_parameters()
         self.host = self.get_parameter('host').value
         try:
             self.port = validate_web_port(self.get_parameter('port').value)
@@ -132,22 +192,67 @@ class MtrbWebBridge(Node, NavPort):
         if not token:
             raise ConfigError(
                 'No auth token: set MTRB_WEB_TOKEN or auth.token in param/web.local.yaml')
-        if is_placeholder_token(token):
-            self.get_logger().warning(
-                'Using the example token from the repository: set a real one in '
-                'param/web.local.yaml or MTRB_WEB_TOKEN')
+        self._check_token_strength(token)
 
         self._read_settings()
+        self._read_teleop_settings()
         self.store = StateStore(clock=self._now_s)
         self.hub = BroadcastHub(self._max_clients)
         self.app = create_app(self.store, token, share + '/web', self.hub, self._max_ws_bytes,
-                              nav_port=self, dock=self._dock)
+                              nav_port=self, dock=self._dock, map_port=self,
+                              map_dir=self._map_dir, on_event=self._log_map_event,
+                              map_min_free_mb=self._map_min_free_mb,
+                              map_min_interval_s=self._map_min_interval_s)
         self.server = None
         self.thread = None
         self._init_state()
         self._init_ros_io()
 
     # --- Configuration ---------------------------------------------------------------
+
+    def _declare_parameters(self):
+        """
+        Declare every parameter; a wrong override type or value raises ConfigError.
+
+        rclpy raises on declaration when an override has a different type than the default
+        (statically typed parameter). The message names the parameter, never its value.
+        """
+        for name, default in PARAMETERS:
+            try:
+                if name in DYNAMIC_PARAMETERS:
+                    self.declare_parameter(
+                        name, default, ParameterDescriptor(dynamic_typing=True))
+                else:
+                    self.declare_parameter(name, default)
+            except (InvalidParameterTypeException, InvalidParameterValueException,
+                    TypeError, ValueError) as err:
+                raise ConfigError(
+                    f'Invalid parameter {name}: wrong type or value ({type(err).__name__})'
+                ) from err
+
+    def _check_token_strength(self, token):
+        """
+        Refuse the example token and tokens shorter than TOKEN_MIN_LENGTH; raise ConfigError.
+
+        The only exception is auth.allow_example_token=true (a strict bool read from the node
+        parameters, never from a client) together with a loopback host: a warning is logged.
+        The token itself is never printed or logged.
+        """
+        allow = self.get_parameter('auth.allow_example_token').value
+        if not isinstance(allow, bool):  # validated always, whatever the token strength
+            raise ConfigError(
+                f'Invalid parameter auth.allow_example_token: {allow!r} (bool)')
+        weak = is_placeholder_token(token) or len(token) < TOKEN_MIN_LENGTH
+        if not weak:
+            return
+        if not (allow and str(self.host).strip().lower() in LOOPBACK_HOSTS):
+            raise ConfigError(
+                f'The auth token is the example one or shorter than {TOKEN_MIN_LENGTH} '
+                'characters: set a real token in param/web.local.yaml or MTRB_WEB_TOKEN '
+                '(auth.allow_example_token is only honoured for a loopback host)')
+        self.get_logger().warning(
+            'DEVELOPMENT ONLY: weak or example auth token accepted because '
+            'auth.allow_example_token is true and the host is loopback')
 
     def _number(self, name, minimum, integer=False):
         """Read a numeric parameter and require a finite value >= minimum."""
@@ -177,6 +282,69 @@ class MtrbWebBridge(Node, NavPort):
             raise ConfigError(f'dock.x/y/yaw must be within +-{DOCK_LIMIT}')
         mode = str(self.get_parameter('mode').value).strip().lower()
         self._mode = mode if mode in MODES else None  # None = unknown, reported as null
+        self._read_status_settings()
+        self._read_map_dir()
+        self._map_min_free_mb = self._number('maps.min_free_mb', 0)
+        self._map_min_interval_s = float(self._number('maps.min_interval_s', 0.0))
+
+    def _read_status_settings(self):
+        """Validate the lifecycle polling rate and node list; raise ConfigError."""
+        rate_hz = self._number('rates.lifecycle', LIFECYCLE_MIN_RATE_HZ)
+        if rate_hz > LIFECYCLE_MAX_RATE_HZ:
+            raise ConfigError(f'Invalid parameter rates.lifecycle: {rate_hz!r} '
+                              f'(at most {LIFECYCLE_MAX_RATE_HZ} Hz)')
+        self._lifecycle_period_s = 1.0 / rate_hz
+        configured = self.get_parameter('status.nodes').value
+        if (not isinstance(configured, (list, tuple)) or len(configured) > LIFECYCLE_MAX_NODES
+                or not all(isinstance(n, str) and NODE_NAME_PATTERN.fullmatch(n)
+                           for n in configured)
+                or len(set(configured)) != len(configured)):
+            raise ConfigError(
+                f'Invalid parameter status.nodes: {configured!r} (at most {LIFECYCLE_MAX_NODES} '
+                'unique node names [A-Za-z_][A-Za-z0-9_]*)')
+        names = list(MODE_NODES.get(self._mode, ())) + [
+            n for n in configured if n not in MODE_NODES.get(self._mode, ())]
+        self._status_nodes = tuple(names)
+
+    def _read_map_dir(self):
+        """Resolve the map directory: parameter map_dir or the default ~/mtrb_maps."""
+        value = self.get_parameter('map_dir').value
+        if not isinstance(value, str):
+            raise ConfigError(f'Invalid parameter map_dir: {value!r} (string)')
+        value = os.path.expanduser(value.strip() or DEFAULT_MAP_DIR)
+        if value.startswith('~'):
+            # HOME is not defined: start anyway, but every save answers 500 map_dir_invalid.
+            self.get_logger().warning(
+                'Cannot resolve the home directory: saving maps is disabled (set map_dir)')
+            self._map_dir = value
+            return
+        if not os.path.isabs(value):
+            raise ConfigError(f'Invalid parameter map_dir: {value!r} (absolute path)')
+        self._map_dir = os.path.normpath(value)  # created with mode 0o755 at the first save
+
+    def _read_teleop_settings(self):
+        """Validate the teleop parameters and build the TeleopGate; raise ConfigError."""
+        limits = {}
+        for name, ceiling in (('max_vx', TELEOP_HARD_MAX_VX_MPS),
+                              ('max_wz', TELEOP_HARD_MAX_WZ_RADPS)):
+            value = self.get_parameter(f'teleop.{name}').value
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or not 0.0 < value <= ceiling):
+                raise ConfigError(
+                    f'Invalid parameter teleop.{name}: {value!r} (must be in (0, {ceiling}])')
+            limits[name] = float(value)
+        timeout_ms = self.get_parameter('teleop.timeout_ms').value
+        if (isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int)
+                or not TELEOP_MIN_TIMEOUT_MS <= timeout_ms <= TELEOP_MAX_TIMEOUT_MS):
+            raise ConfigError(
+                f'Invalid parameter teleop.timeout_ms: {timeout_ms!r} (integer between '
+                f'{TELEOP_MIN_TIMEOUT_MS} and {TELEOP_MAX_TIMEOUT_MS})')
+        enabled = self.get_parameter('teleop.enabled').value
+        if not isinstance(enabled, bool):
+            raise ConfigError(f'Invalid parameter teleop.enabled: {enabled!r} (bool)')
+        self._teleop_gate = TeleopGate(
+            limits['max_vx'], limits['max_wz'], timeout_ms / MS_PER_S, time.monotonic,
+            enabled=enabled)  # monotonic, NOT the ROS clock: see _init_ros_io watchdog timer
 
     def _now_s(self):
         """Return the ROS time in seconds (sim time aware); never the wall clock."""
@@ -222,7 +390,14 @@ class MtrbWebBridge(Node, NavPort):
         # 'stamp_ns' is the ROS time of the DECISION (see _request_cancel_all); retries reuse it.
         self._cancel_all = None
         self._cancel_all_warn_s = float('-inf')  # last 'service not ready' warning
+        self._stop_context = threading.local()  # per-thread: True while stop() runs
+        self._last_cancel_all_armed_s = None  # monotonic time of the last armed cancel-all
         self._cancel_all_client = None  # public CancelGoal service client (see _init_ros_io)
+        # Teleop: one lock serializes gate decisions AND the publishing that follows, so a
+        # stop can never be overtaken by a command that was accepted just before it.
+        # Lock order: _teleop_lock -> _nav_lock (never the reverse).
+        self._teleop_lock = threading.Lock()
+        self._cmd_vel_nav_pub = None    # created in _init_ros_io
 
     def _init_ros_io(self):
         """Create the TF buffer, subscriptions (read-only) and timers."""
@@ -249,9 +424,53 @@ class MtrbWebBridge(Node, NavPort):
             CancelGoal, 'navigate_to_pose/_action/cancel_goal')
         self._initial_pose_pub = self.create_publisher(
             PoseWithCovarianceStamped, 'initialpose', 10)
+        # SAFETY: the only direct-velocity path of the web. Relative name -> /r2/cmd_vel_nav
+        # (input of velocity_smoother), geometry_msgs/Twist (NOT TwistStamped). The web NEVER
+        # publishes on `cmd_vel` (only velocity_smoother does). Second allowed publisher
+        # next to `initialpose`; commands come only from TeleopGate decisions.
+        self._cmd_vel_nav_pub = self.create_publisher(Twist, 'cmd_vel_nav', 10)
         self.create_timer(NAV_WATCHDOG_PERIOD_S, self._nav_watchdog)
+        # Own callback group: a slow callback of the default group (map encoding...) must not
+        # delay the teleop watchdog.
+        # The timer uses a STEADY (monotonic) clock on purpose: with use_sim_time=false the
+        # default ROS clock follows the system clock, and a backwards jump (NTP step) would
+        # leave the 20 ms timer silent for the size of the jump, so the last command could
+        # stay active. The gate's clock is monotonic for the same reason.
+        self.create_timer(TELEOP_WATCHDOG_PERIOD_S, self._teleop_watchdog,
+                          callback_group=MutuallyExclusiveCallbackGroup(),
+                          clock=Clock(clock_type=ClockType.STEADY_TIME))
         # No lock needed: the executor is not spinning yet, nothing else touches the state.
         self._publish_nav(NAV_IDLE, None)
+        self._init_status_io()
+        self._init_map_clients()
+
+    def _init_status_io(self):
+        """Odometry age and lifecycle polling for the `status` message (read-only)."""
+        # Relative name -> /<ns>/odom (Create 3). Only the arrival time is kept.
+        self.create_subscription(Odometry, 'odom', self._on_odom, qos_profile_sensor_data)
+        # Own callback group: slow default-group callbacks (map encoding) never delay the
+        # polling, and the polling (tiny callbacks) never touches teleop or goals.
+        group = MutuallyExclusiveCallbackGroup()
+        self._lifecycle_lock = threading.Lock()  # guards the three dicts below only
+        self._lifecycle_states = {name: STATE_UNKNOWN for name in self._status_nodes}
+        self._lifecycle_seq = {name: 0 for name in self._status_nodes}
+        self._lifecycle_pending = {}   # node name -> Future of the request in flight
+        # Relative names -> /<ns>/<node>/get_state (every lifecycle node serves it).
+        self._lifecycle_clients = {
+            name: self.create_client(GetState, f'{name}/get_state', callback_group=group)
+            for name in self._status_nodes}
+        self.create_timer(self._lifecycle_period_s, self._poll_lifecycle,
+                          callback_group=group)
+
+    def _init_map_clients(self):
+        """Public clients of the slam_toolbox map services (used from HTTP threads)."""
+        # Reentrant group of its own: the answers are processed by any free executor thread,
+        # independently of the default group (a busy map callback cannot delay them).
+        group = ReentrantCallbackGroup()
+        self._save_map_client = self.create_client(
+            SaveMap, SAVE_MAP_SERVICE, callback_group=group)
+        self._serialize_client = self.create_client(
+            SerializePoseGraph, SERIALIZE_MAP_SERVICE, callback_group=group)
 
     def _warn_throttled(self, key, text):
         """Log a warning at most once per LOG_THROTTLE_S for each key (no sensitive data)."""
@@ -291,6 +510,61 @@ class MtrbWebBridge(Node, NavPort):
         """Keep the latest scan; processing happens in the 5 Hz timer."""
         self._scan_msg = msg
         self._scan_rx_s = self._now_s()
+
+    def _on_odom(self, _msg):
+        """Keep only the arrival time of the odometry (its content is not used)."""
+        self._odom_rx_s = self._now_s()
+
+    def _poll_lifecycle(self):
+        """
+        Ask every watched node for its lifecycle state without blocking.
+
+        A request still pending from the previous tick is dropped (the state becomes
+        'unknown'), so nothing accumulates. Answers arrive in `_on_lifecycle`.
+        """
+        for name, client in self._lifecycle_clients.items():
+            with self._lifecycle_lock:
+                stale = self._lifecycle_pending.pop(name, None)
+                self._lifecycle_seq[name] += 1
+                seq = self._lifecycle_seq[name]
+                if stale is not None:
+                    self._lifecycle_states[name] = STATE_UNKNOWN
+            if stale is not None:
+                client.remove_pending_request(stale)
+            try:
+                if not client.service_is_ready():
+                    self._set_lifecycle_state(name, seq, STATE_UNAVAILABLE)
+                    continue
+                future = client.call_async(GetState.Request())
+            except Exception as err:  # noqa: B902 - polling must never stop the timer
+                self._warn_throttled(f'lifecycle-{name}', f'Lifecycle query failed: {err}')
+                self._set_lifecycle_state(name, seq, STATE_UNKNOWN)
+                continue
+            with self._lifecycle_lock:
+                if self._lifecycle_seq[name] == seq:
+                    self._lifecycle_pending[name] = future
+            future.add_done_callback(functools.partial(self._on_lifecycle, name, seq))
+
+    def _set_lifecycle_state(self, name, seq, state):
+        """Store a node state unless a newer request replaced the one with number `seq`."""
+        with self._lifecycle_lock:
+            if self._lifecycle_seq[name] == seq:
+                self._lifecycle_states[name] = state
+                self._lifecycle_pending.pop(name, None)
+
+    def _on_lifecycle(self, name, seq, future):
+        """Store the lifecycle label of `name` from a GetState answer (invalid -> unknown)."""
+        try:
+            label = str(future.result().current_state.label).strip().lower()
+        except Exception:  # noqa: B902 - a failed call is just an unknown state
+            label = STATE_UNKNOWN
+        self._set_lifecycle_state(
+            name, seq, label if label in LIFECYCLE_LABELS else STATE_UNKNOWN)
+
+    def _lifecycle_snapshot(self):
+        """Return {node: state} (a copy, safe to serialize)."""
+        with self._lifecycle_lock:
+            return dict(self._lifecycle_states)
 
     def _on_battery(self, msg):
         """Store the battery charge as a percentage; NaN or out of range becomes unknown."""
@@ -336,6 +610,57 @@ class MtrbWebBridge(Node, NavPort):
             'width': info.width, 'height': info.height, 'resolution': info.resolution,
             'origin_x': info.origin.position.x, 'origin_y': info.origin.position.y,
             'data': msg.data})
+
+    # --- Map saving (MapPort) --------------------------------------------------------
+
+    def _log_map_event(self, level, text):
+        """Log an event of the map saver ('info' | 'warning' | 'error'; no sensitive data)."""
+        log = self.get_logger()
+        {'warning': log.warning, 'error': log.error}.get(level, log.info)(text)
+
+    def ready(self):
+        """Return True if the slam_toolbox save_map service is available (non-blocking)."""
+        return self._save_map_client.service_is_ready()
+
+    def save_map(self, base_path, timeout_s):
+        """Call slam_toolbox/save_map for `base_path`; True if it reported success."""
+        request = SaveMap.Request()
+        request.name = String(data=base_path)
+        response = self._call_service(self._save_map_client, request, timeout_s)
+        return response is not None and response.result == SaveMap.Response.RESULT_SUCCESS
+
+    def serialize_posegraph(self, base_path, timeout_s):
+        """Call slam_toolbox/serialize_map for `base_path`; True if it reported success."""
+        request = SerializePoseGraph.Request()
+        request.filename = base_path
+        response = self._call_service(self._serialize_client, request, timeout_s)
+        return (response is not None
+                and response.result == SerializePoseGraph.Response.RESULT_SUCCESS)
+
+    @staticmethod
+    def _call_service(client, request, timeout_s):
+        """
+        Send `request` and wait at most `timeout_s` for the answer; None if it failed.
+
+        Only for HTTP (thread pool) threads: it blocks the caller, never an executor
+        thread or the event loop. The answer is processed by the executor, which sets the
+        event. Raise SlamUnavailableError (service not ready) or SlamTimeoutError.
+        """
+        if not client.service_is_ready():
+            raise SlamUnavailableError('Service not ready')
+        done = threading.Event()
+        try:
+            future = client.call_async(request)
+        except Exception as err:  # noqa: B902 - any rclpy failure means "not available"
+            raise SlamUnavailableError(f'Request could not be sent: {err}') from err
+        future.add_done_callback(lambda _future: done.set())
+        # Check done() too: the callback may have been added after completion.
+        if not future.done() and not done.wait(timeout_s):
+            client.remove_pending_request(future)  # frees the pending entry; late answer dropped
+            raise SlamTimeoutError('No answer in time')
+        if future.exception() is not None:
+            return None
+        return future.result()
 
     # --- Navigation (NavPort) --------------------------------------------------------
 
@@ -390,6 +715,13 @@ class MtrbWebBridge(Node, NavPort):
             # A pending cancel-all must never hit the goal that is being sent now.
             self._cancel_all = None
             self._publish_nav(NAV_ACTIVE, None)
+        # Goal vs teleop: the goal wins and the teleop is stopped FIRST (zero Twist, lease
+        # released) instead of answering 409, so the operator's explicit request is honoured
+        # and two controllers never drive together. The goal is already tracked above, so any
+        # teleop message arriving from now on is rejected as "navigation busy".
+        # The teleop is therefore already stopped if send_goal_async fails below (safe side:
+        # the error path never leaves the robot driven by the teleop of an unsent goal).
+        self._teleop_stop_if_owned()
         try:
             future = self._nav_client.send_goal_async(
                 goal, feedback_callback=lambda fb: self._on_nav_feedback(goal_id, fb))
@@ -409,6 +741,9 @@ class MtrbWebBridge(Node, NavPort):
         tracked (no current goal, no orphan) a "cancel all" is sent instead: it cancels EVERY
         goal of navigate_to_pose, also those of other clients (same as the manual
         `ros2 service call` fallback), because the goal may be running without a handle.
+        When called from stop() (repeated stops) that cancel-all is not armed again if
+        another one was armed less than STOP_CANCEL_ALL_MIN_PERIOD_S ago (it is still
+        pending and retried); tracked goals and orphans are always canceled.
         """
         now = self._now_s()
         send_all = False
@@ -416,7 +751,7 @@ class MtrbWebBridge(Node, NavPort):
         with self._nav_lock:
             token, handle = self._nav_token, self._nav_handle
             targets = []
-            if token is None and not self._nav_orphans:
+            if token is None and not self._nav_orphans and not self._cancel_all_coalesced():
                 # Decision instant, read under the lock: a goal sent later gets a later stamp.
                 stamp_ns = self._now_ns()
                 self._cancel_all = {'retry_s': now, 'attempts': 0, 'stamp_ns': stamp_ns}
@@ -438,6 +773,17 @@ class MtrbWebBridge(Node, NavPort):
             self.get_logger().info(
                 f'Navigation cancel requested ({len(targets)} handle(s), '
                 f'cancel-all {"yes" if send_all else "no"})')
+
+    def _cancel_all_coalesced(self):
+        """Return True if a stop-armed cancel-all is skipped as too close to the last one."""
+        coalesce = getattr(self._stop_context, 'active', False)  # set only by stop()
+        mono_s = time.monotonic()  # monotonic: immune to clock jumps
+        last_s = self._last_cancel_all_armed_s
+        if coalesce and last_s is not None and 0.0 <= mono_s - last_s < \
+                STOP_CANCEL_ALL_MIN_PERIOD_S:
+            return True
+        self._last_cancel_all_armed_s = mono_s
+        return False
 
     def _request_cancel(self, token, handle):
         """
@@ -500,16 +846,32 @@ class MtrbWebBridge(Node, NavPort):
             request = CancelGoal.Request()  # goal_id stays all zeros
             request.goal_info.stamp = Time(nanoseconds=max(1, stamp_ns)).to_msg()
             future = client.call_async(request)
-            future.add_done_callback(self._on_cancel_all_response)
+            future.add_done_callback(
+                lambda fut, stamp=stamp_ns: self._on_cancel_all_response(stamp, fut))
             return True
         except Exception as err:  # noqa: B902
             self.get_logger().error(f'Cancel-all request failed: {err}; will retry')
             return True  # a real attempt that failed: it counts, so the retries stay bounded
 
-    def _on_cancel_all_response(self, future):
-        """Stop retrying the cancel-all once Nav2 answered; a rejection is retried."""
+    def _on_cancel_all_response(self, stamp_ns, future):
+        """
+        Handle the answer to the cancel-all sent for `stamp_ns`; stale answers are ignored.
+
+        Only an answer whose stamp matches the pending cancel-all may clear it: a late answer
+        to an older cancel-all must not cancel the retries of a newer one. A rejection or a
+        failed call leaves the pending entry untouched, so the watchdog retries it.
+        """
+        with self._nav_lock:
+            pending = self._cancel_all
+            current = pending is not None and pending['stamp_ns'] == stamp_ns
+        if not current:
+            self.get_logger().debug(
+                f'Ignoring stale cancel-all answer (stamp_ns={stamp_ns})')
+            return
         try:
-            code = future.result().return_code
+            result = future.result()
+            code = result.return_code
+            canceling = len(getattr(result, 'goals_canceling', ()))  # for the log only
         except Exception as err:  # noqa: B902
             self.get_logger().warning(f'No cancel-all answer: {err}; will retry')
             return
@@ -518,8 +880,14 @@ class MtrbWebBridge(Node, NavPort):
             self.get_logger().warning(f'Cancel-all rejected (code {code}); will retry')
             return
         with self._nav_lock:
+            pending = self._cancel_all
+            if pending is None or pending['stamp_ns'] != stamp_ns:
+                self.get_logger().debug(
+                    f'Ignoring stale cancel-all answer (stamp_ns={stamp_ns})')
+                return
             self._cancel_all = None  # answered: goals canceled or none was running
-        self.get_logger().info(f'Cancel-all answered by Nav2 (code {code})')
+        self.get_logger().info(
+            f'Cancel-all answered by Nav2 (code {code}, goals_canceling={canceling})')
 
     def _on_cancel_response(self, token, future):
         """Check the return code of a cancel request; anything but success is retried."""
@@ -554,6 +922,126 @@ class MtrbWebBridge(Node, NavPort):
         msg.pose.covariance[35] = INITIAL_COVARIANCE_YAW
         self._initial_pose_pub.publish(msg)
         self.get_logger().info('Initial pose published from the web')
+
+    # --- Teleop (NavPort) ------------------------------------------------------------
+    # All decisions come from TeleopGate; these methods only execute them. No message
+    # content is logged.
+
+    def _nav_busy(self):
+        """
+        Return True if Nav2 may be driving: goal, unconfirmed (orphan) goal or pending cancel-all.
+
+        A pending cancel-all only counts while the navigate_to_pose action server is up:
+        with Nav2 absent (e.g. mode mapping) nothing can be driving, and a stop must not
+        block the teleop for good. Goals and orphans always count.
+        """
+        with self._nav_lock:
+            if self._nav_token is not None or self._nav_orphans:
+                return True
+            cancel_all_pending = self._cancel_all is not None
+        return cancel_all_pending and self._nav_client.server_is_ready()
+
+    def _publish_cmd_vel_nav(self, vx_mps, wz_radps):
+        """Publish one Twist (only linear.x and angular.z) on cmd_vel_nav; never raises."""
+        try:
+            msg = Twist()
+            msg.linear.x = float(vx_mps)
+            msg.angular.z = float(wz_radps)
+            self._cmd_vel_nav_pub.publish(msg)
+        except Exception as err:  # noqa: B902 - keep trying the remaining zeros
+            self.get_logger().error(f'Could not publish on cmd_vel_nav: {err}')
+
+    def _teleop_execute(self, action):
+        """Execute a TeleopAction; `_teleop_lock` must be held. Zeros go first."""
+        for _ in range(action.zeros):
+            self._publish_cmd_vel_nav(0.0, 0.0)
+        if action.zeros:
+            self.get_logger().info(f'Teleop ended: {action.zeros} zero Twist(s) published')
+        if action.kind == TELEOP_PUBLISH and action.twist is not None:
+            self._publish_cmd_vel_nav(*action.twist)
+
+    def teleop(self, client_id, message):
+        """Handle a teleop message; return None or an (code, detail) error for the client."""
+        gate = self._teleop_gate
+        if gate is None:
+            return ('teleop_rejected', 'Teleop is not configured')
+        try:
+            with self._teleop_lock:
+                # Read busy INSIDE the lock: send_goal tracks the goal first and stops the
+                # teleop later, so either we see the goal or the stop runs after us.
+                action = gate.on_teleop(client_id, message, self._nav_busy())
+                self._teleop_execute(action)
+        except Exception as err:  # noqa: B902 - fail safe: stop and tell the client
+            self.get_logger().error(f'Teleop failed, stopping: {err}')
+            self._stop_teleop_only()
+            return ('teleop_rejected', 'Internal teleop error')
+        if action.error is not None:
+            self._warn_throttled('teleop-reject', f'Teleop rejected ({action.error[0]})')
+        return action.error
+
+    def _stop_teleop_only(self):
+        """Zero Twist burst and release the lease; works without a gate. Never raises."""
+        try:
+            with self._teleop_lock:
+                gate = self._teleop_gate
+                action = gate.stop() if gate is not None else TeleopAction(
+                    TELEOP_ZERO, None, TELEOP_ZERO_BURST, None)
+                self._teleop_execute(action)
+        except Exception as err:  # noqa: B902
+            self.get_logger().error(f'Could not stop the teleop: {err}')
+
+    def _teleop_stop_if_owned(self):
+        """Stop the teleop only if a controller holds the lease (used before a goal)."""
+        gate = self._teleop_gate
+        if gate is None:
+            return
+        try:
+            with self._teleop_lock:
+                if gate.owner_age_s is not None:
+                    self._teleop_execute(gate.stop())
+        except Exception as err:  # noqa: B902
+            self.get_logger().error(f'Could not stop the teleop: {err}')
+
+    def teleop_disconnect(self, client_id):
+        """Zero Twist at once if the WebSocket of the controlling client closed."""
+        gate = self._teleop_gate
+        if gate is None:
+            return
+        try:
+            with self._teleop_lock:
+                self._teleop_execute(gate.client_disconnected(client_id))
+        except Exception as err:  # noqa: B902
+            self.get_logger().error(f'Teleop disconnect handling failed: {err}')
+            self._stop_teleop_only()
+
+    def stop(self):
+        """
+        Stop: zero Twist burst first, then cancel the goals; needs no Nav2, map or mode.
+
+        The zero Twist is always issued before (and independently of) the cancel, which
+        never raises by design; a failure there is only logged.
+        """
+        self.get_logger().warning('Stop requested from the web')
+        self._stop_teleop_only()
+        self._stop_context.active = True
+        try:
+            self.cancel()
+        except Exception as err:  # noqa: B902
+            self.get_logger().error(f'Cancel during stop failed: {err}')
+        finally:
+            self._stop_context.active = False
+
+    def _teleop_watchdog(self):
+        """Periodic: zero Twist burst (once) when the controlling client went silent."""
+        gate = self._teleop_gate
+        if gate is None:
+            return
+        try:
+            with self._teleop_lock:
+                self._teleop_execute(gate.watchdog_tick())
+        except Exception as err:  # noqa: B902
+            self.get_logger().error(f'Teleop watchdog failed: {err}')
+            self._stop_teleop_only()
 
     def _clear_current_locked(self):
         """Empty the current-goal slot; `_nav_lock` must be held."""
@@ -776,12 +1264,15 @@ class MtrbWebBridge(Node, NavPort):
         self._publish('scan', stamp=round(laser[3], 3), points=flat)
 
     def _broadcast_status(self):
-        """1 Hz: battery, mode and data ages (null = unknown)."""
+        """1 Hz: battery, mode, node states and data ages (null = unknown)."""
         scan_age = None if self._scan_rx_s is None else max(0.0, self._now_s() - self._scan_rx_s)
         scan_age = None if scan_age is None else round(scan_age, 2)
         dock = dict(zip(('x', 'y', 'yaw'), self._dock))  # validated finite in _read_settings
-        self._publish('status', battery_pct=self._battery_pct, mode=self._mode, nodes={},
-                      scan_age=scan_age, odom_age=None, dock=dock)
+        odom_rx_s = self._odom_rx_s
+        odom_age = None if odom_rx_s is None else round(max(0.0, self._now_s() - odom_rx_s), 2)
+        self._publish('status', battery_pct=self._battery_pct, mode=self._mode,
+                      nodes=self._lifecycle_snapshot(), scan_age=scan_age,
+                      odom_age=odom_age, dock=dock)
         self.store.update(mode=self._mode, scan_age=scan_age, battery_pct=self._battery_pct)
 
     def _broadcast_map(self):
@@ -884,6 +1375,14 @@ def main(args=None):
         pass
     finally:
         if node is not None:
+            # Last-chance zeros before the publisher disappears (SIGINT / shutdown). The
+            # context may already be shut down by the signal handler: then the publish
+            # fails and is only logged.
+            try:
+                node._stop_teleop_only()
+            except Exception as err:  # noqa: B902
+                rclpy.logging.get_logger('mtrb_web_bridge').error(
+                    f'Final zero Twist burst failed: {err}')
             node.stop_server()
             node.destroy_node()
         if rclpy.ok():

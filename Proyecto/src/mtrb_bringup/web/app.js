@@ -44,13 +44,28 @@
   }
 
   // Wrap an angle to (-pi, pi].
+  function clampAbs(v, max) {
+    if (!isNum(v)) return 0;
+    return Math.max(-max, Math.min(max, v));
+  }
   function normalizeYaw(a) {
     while (a > Math.PI) a -= 2 * Math.PI;
     while (a <= -Math.PI) a += 2 * Math.PI;
     return a;
   }
   var REQUEST_TIMEOUT_MS = 8000;   // default POST timeout
-  var CANCEL_TIMEOUT_MS = 3000;    // /api/cancel must fail fast to allow an immediate retry
+  var CANCEL_TIMEOUT_MS = 3000;    // /api/cancel and /api/stop must fail fast to allow an immediate retry
+  // INITIAL, must match web.yaml (teleop.max_vx / teleop.max_wz). The server saturates anyway;
+  // the client never asks for more than this.
+  var MAX_VX = 0.2;                // m/s
+  // INITIAL, must match web.yaml
+  var MAX_WZ = 0.8;                // rad/s
+  var TELEOP_PERIOD_MS = 100;      // 10 Hz while a control is held (server limit: 30 Hz)
+  var TELEOP_ZERO_REPEAT_MS = 50;  // second zero after a release (the first may hit the rate limit)
+  var TELEOP_IDLE_MS = 30000;      // the switch turns itself off after this long without use
+  var TELEOP_MSG_THROTTLE_MS = 3000;
+  var STOP_STATUS_MS = 5000;
+  var JOY_KNOB_PX = 28;            // knob radius, keep in sync with style.css
   var NAV_LABELS = { idle: 'Inactivo', active: 'Navegando', succeeded: 'Llegado',
     canceled: 'Cancelado', failed: 'Fallido' };
   // User-facing Spanish message for a failed command. `status` is the HTTP status
@@ -69,6 +84,50 @@
     if (status === 400) return 'Petición no válida.';
     if (status === 0) return 'No se pudo contactar con el robot.';
     return 'No se pudo completar la acción (error ' + status + ').';
+  }
+
+  // ---- map saving: validation and messages (mirrors the server) ----
+  var MAP_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,39}$/;
+  // The server may take ~30 s (15 s save_map + 15 s serialize_map) plus waiting for its lock.
+  var SAVE_TIMEOUT_MS = 40000;
+  var AGE_WARN_S = 2;              // scan/odom older than this raise a warning
+  var TRAIL_MAX_POINTS = 3000;
+  var TRAIL_MIN_STEP_M = 0.05;
+  var LAYERS_KEY = 'mtrb_layers';
+  var LAYER_IDS = { scan: 'layer-scan', plan: 'layer-plan', dock: 'layer-dock', trail: 'layer-trail' };
+  var NODE_LABELS = { active: 'Activo', inactive: 'Inactivo', unconfigured: 'Sin configurar',
+    finalized: 'Finalizado', unknown: 'Desconocido', unavailable: 'No disponible' };
+  var MSG_INVALID_NAME = 'Nombre no válido: solo letras (sin tildes ni ñ), números, guion y guion bajo (máx. 40).';
+  var MSG_NAME_DASH = 'El nombre no puede empezar por guion.';
+  var MSG_NAME_RESERVED = 'Nombre reservado: elige otro nombre distinto de «map».';
+  var MSG_SAVE_TIMEOUT = 'Sin respuesta del robot; comprueba en «Mapas guardados» si se guardó.';
+  function isReservedMapName(n) { return typeof n === 'string' && n.toLowerCase() === 'map'; }
+  function isValidMapName(n) {
+    return typeof n === 'string' && MAP_NAME_RE.test(n) && !isReservedMapName(n);
+  }
+  // Specific Spanish reason why a name is rejected ('' when it is valid).
+  function mapNameProblem(n) {
+    if (typeof n !== 'string' || !n) return 'Escribe un nombre para el mapa.';
+    if (n.charAt(0) === '-' && /^[A-Za-z0-9_-]{1,40}$/.test(n)) return MSG_NAME_DASH;
+    if (MAP_NAME_RE.test(n) && isReservedMapName(n)) return MSG_NAME_RESERVED;
+    return MAP_NAME_RE.test(n) ? '' : MSG_INVALID_NAME;
+  }
+  // Spanish message for a failed POST /api/map/save (status 0 = no response).
+  function describeSaveError(status, code, timeout) {
+    if (timeout) return MSG_SAVE_TIMEOUT;
+    if (status === 401) return 'Sesión no válida: introduce el token de nuevo.';
+    if (code === 'save_timeout') return 'El robot tardó demasiado en guardar el mapa; comprueba en «Mapas guardados» si se guardó.';
+    if (status === 400 && code === 'invalid_name') return MSG_INVALID_NAME;
+    if (status === 400 && code === 'reserved_name') return MSG_NAME_RESERVED;
+    if (status === 409 && code === 'wrong_mode') return 'Solo se puede guardar el mapa en modo mapeo (mapping).';
+    if (status === 409 && code === 'save_in_progress') return 'Ya hay un guardado en curso; espera a que termine.';
+    if (status === 409 && code === 'backup_pending') return 'Hay un respaldo anterior sin resolver de este mapa. ' +
+      'Revisa o elimina los archivos .bak en el robot.';
+    if (status === 409 && code === 'map_limit') return 'Hay demasiados mapas guardados: elimina alguno en el robot antes de guardar otro.';
+    if (status === 429 && code === 'save_rate_limited') return 'Espera unos segundos antes de guardar de nuevo.';
+    if (status === 507 && code === 'insufficient_storage') return 'No hay espacio libre suficiente en el robot para guardar el mapa.';
+    if (status === 503 && code === 'slam_unavailable') return 'SLAM no disponible: no se puede guardar el mapa ahora.';
+    return describeApiError(status, code);
   }
 
   // ---- token storage (localStorage may be blocked, e.g. private mode) ----
@@ -110,7 +169,26 @@
     pickInitial: false,  // next tap sets the initial pose instead of a goal
     goalRejected: false, // last goal POST was rejected (400/503) with no goal running
     busy: {},            // action name -> true while its request is in flight
-    dockConfirm: false
+    dockConfirm: false,
+    trail: [],           // flat [x0, y0, ...] of the path travelled (client side)
+    saveBusy: false,     // POST /api/map/save in flight
+    overwriteName: null, // name awaiting explicit overwrite confirmation
+    mapsReq: 0           // sequence number of GET /api/maps (stale answers are ignored)
+  };
+
+  // Teleoperation state (disabled by default; see the teleop section).
+  var teleop = {
+    enabled: false,
+    timer: null,         // setInterval id of the 10 Hz send loop
+    running: false,
+    zeroTimer: null,
+    idleTimer: null,
+    seq: 0,              // strictly increasing per WebSocket connection
+    joyId: null,         // pointerId that owns the joystick
+    joy: { x: 0, y: 0 }, // normalized joystick deflection, screen axes, |.| <= 1
+    keys: {},            // pressed teleop keys
+    msgText: '',
+    msgAt: -1e9
   };
 
   // ---- zlib inflate fallback (used only without DecompressionStream) ----
@@ -223,7 +301,8 @@
   window.MTRBPure = {
     worldToScreen: worldToScreen, screenToWorld: screenToWorld, inflateRaw: inflateRaw,
     isValidToken: isValidToken, sanitizePlan: sanitizePlan, sanitizeScan: sanitizeScan,
-    normalizeYaw: normalizeYaw, describeApiError: describeApiError
+    normalizeYaw: normalizeYaw, describeApiError: describeApiError, clampAbs: clampAbs,
+    isValidMapName: isValidMapName, mapNameProblem: mapNameProblem, describeSaveError: describeSaveError
   };
 
   function zlibDecompress(bytes, expectedSize) {
@@ -342,6 +421,15 @@
 
     var px = 1 / v.scale;  // one screen pixel in meters
 
+    if ($('layer-trail').checked && state.trail.length >= 4) {
+      ctx.beginPath();
+      ctx.moveTo(state.trail[0], state.trail[1]);
+      for (var t = 2; t + 1 < state.trail.length; t += 2) ctx.lineTo(state.trail[t], state.trail[t + 1]);
+      ctx.strokeStyle = '#ffd54f';
+      ctx.lineWidth = 2 * px;
+      ctx.stroke();
+    }
+
     if ($('layer-plan').checked && state.plan.length > 1) {
       ctx.beginPath();
       ctx.moveTo(state.plan[0][0], state.plan[0][1]);
@@ -434,8 +522,12 @@
 
   function setBadge(cls, text) {
     var b = $('conn');
-    b.className = 'badge ' + cls;
-    $('conn-text').textContent = text;
+    // Skip identical writes: a polite live region would re-announce them every 500 ms.
+    if (b.className !== 'badge ' + cls) b.className = 'badge ' + cls;
+    if ($('conn-text').textContent !== text) $('conn-text').textContent = text;
+    var c = $('st-conn');
+    if (c.textContent !== text) c.textContent = text;
+    c.className = cls;
   }
 
   function updateStatus() {
@@ -490,8 +582,10 @@
     $('st-pose').textContent = state.pose ? 'x ' + state.pose.x.toFixed(2) + ' m, y ' +
       state.pose.y.toFixed(2) + ' m, ' + (state.pose.yaw * 180 / Math.PI).toFixed(0) + '°' : '-';
     updateActions();
+    updateRobotPanel();
     $('st-map').textContent = state.map ? state.map.meta.width + '×' + state.map.meta.height +
       ' @ ' + state.map.meta.resolution + ' m' : 'Esperando mapa…';
+    updateTeleopUi();
   }
 
   // ---- message handling ----
@@ -502,6 +596,7 @@
         if (isNum(msg.x) && isNum(msg.y) && isNum(msg.yaw)) {
           state.pose = { x: msg.x, y: msg.y, yaw: msg.yaw };
           state.lastPoseAt = performance.now();
+          addTrailPoint(msg.x, msg.y);
           state.dirty = true;
         }
         break;
@@ -520,6 +615,7 @@
         if (msg.state === 'active') state.goalRejected = false;
         break;
       case 'status': state.status = msg; break;
+      case 'error': handleServerError(msg); break;
       case 'map_meta':
         if (isNum(msg.version) && isNum(msg.width) && isNum(msg.height) && isNum(msg.resolution) &&
             isNum(msg.origin_x) && isNum(msg.origin_y) && msg.width > 0 && msg.height > 0 &&
@@ -542,6 +638,8 @@
     state.lastPoseAt = performance.now();
     hideLogin();
     updateActions();
+    updateRobotPanel();
+    if ($('map-box').open) fetchMaps();
   }
 
   function onMessage(ev) {
@@ -588,16 +686,20 @@
     try { ws = new WebSocket(wsUrl()); } catch (e) { scheduleRetry(); return; }
     ws.binaryType = 'arraybuffer';
     state.ws = ws;
+    state.goalRejected = false; // a new connection may have missed the nav 'active'
+    teleop.seq = 0;             // seq restarts with every connection
     ws.onopen = function () { /* wait for the first valid message: see markConnected */ };
     ws.onmessage = function (ev) { if (state.ws === ws) onMessage(ev); };
     ws.onclose = function (ev) {
       if (state.ws !== ws) return;
       state.connected = false;
       state.ws = null;
+      teleopConnectionLost();
       state.closeNotice = (ev && ev.code === 1013) ?
         'Demasiados clientes conectados al robot. Reintentando…' : '';
       updateStatus();
       updateActions();
+      updateRobotPanel();
       checkTokenValid().then(function (ok) {
         if (!ok) {
           state.authFailed = true;
@@ -619,8 +721,10 @@
     var ws = state.ws;
     state.ws = null;
     state.connected = false;
+    teleopConnectionLost();
     if (ws) { try { ws.close(); } catch (e) { /* ignore */ } }
     updateActions();
+    updateRobotPanel();
   }
 
   // ---- login ----
@@ -757,6 +861,8 @@
     zoomAt(p.x, p.y, Math.exp(-ev.deltaY * 0.0015));
   }, { passive: false });
   canvas.addEventListener('keydown', function (ev) {
+    // With teleoperation on, the arrow keys drive the robot instead of panning the map.
+    if (teleop.enabled && teleopKeyFor(ev.key)) return;
     var step = 40 / state.view.scale, v = state.view;
     if (ev.key === 'ArrowLeft') v.cx -= step;
     else if (ev.key === 'ArrowRight') v.cx += step;
@@ -770,9 +876,9 @@
   });
 
   $('btn-center').addEventListener('click', centerOnRobot);
-  $('layer-scan').addEventListener('change', function () { state.dirty = true; });
-  $('layer-plan').addEventListener('change', function () { state.dirty = true; });
-  $('layer-dock').addEventListener('change', function () { state.dirty = true; });
+  Object.keys(LAYER_IDS).forEach(function (k) {
+    $(LAYER_IDS[k]).addEventListener('change', function () { state.dirty = true; saveLayers(); });
+  });
   window.addEventListener('resize', function () { resize(); });
 
   // ---- commands (browser -> robot) ----
@@ -823,13 +929,14 @@
     var hasDock = !!getDock();
     $('layer-dock').disabled = !hasDock;
     $('dock-note').hidden = hasDock;
+    updateSaveUi();
   }
 
   // POST helper: resolves {ok, status, data, timeout?}; never rejects (network failure -> status 0).
   // A request without answer within `timeoutMs` is aborted and resolves {status: 0, timeout: true},
   // so a half-open Wi-Fi link cannot keep a button locked.
-  function postJson(path, body, timeoutMs) {
-    var init = { method: 'POST', headers: { Authorization: 'Bearer ' + state.token } };
+  function requestJson(method, path, body, timeoutMs) {
+    var init = { method: method, headers: { Authorization: 'Bearer ' + state.token } };
     var ctl = typeof AbortController === 'function' ? new AbortController() : null;
     if (ctl) init.signal = ctl.signal;
     if (body !== undefined) {
@@ -855,6 +962,8 @@
       }).catch(function () { finish({ ok: false, status: 0, data: {} }); });
     });
   }
+
+  function postJson(path, body, timeoutMs) { return requestJson('POST', path, body, timeoutMs); }
 
   // Run one command with a per-action in-flight lock (prevents double submits).
   function runCommand(name, path, body, okText) {
@@ -963,6 +1072,566 @@
   });
   $('yaw-input').addEventListener('change', updateActions);
 
+
+  // ---- travelled path (client side), layers memory ----
+  function addTrailPoint(x, y) {
+    var t = state.trail, n = t.length;
+    if (n >= 2 && Math.hypot(x - t[n - 2], y - t[n - 1]) < TRAIL_MIN_STEP_M) return;
+    t.push(x, y);
+    if (t.length > TRAIL_MAX_POINTS * 2) t.splice(0, t.length - TRAIL_MAX_POINTS * 2);
+  }
+
+  function saveLayers() {
+    var o = {};
+    Object.keys(LAYER_IDS).forEach(function (k) { o[k] = !!$(LAYER_IDS[k]).checked; });
+    try { window.localStorage.setItem(LAYERS_KEY, JSON.stringify(o)); } catch (e) { /* ignore */ }
+  }
+  function loadLayers() {
+    var o = null;
+    try { o = JSON.parse(window.localStorage.getItem(LAYERS_KEY) || 'null'); } catch (e) { o = null; }
+    if (!o || typeof o !== 'object') return;
+    Object.keys(LAYER_IDS).forEach(function (k) {
+      if (typeof o[k] === 'boolean') $(LAYER_IDS[k]).checked = o[k];
+    });
+    state.dirty = true;
+  }
+
+  // ---- robot status panel ----
+  function clearChildren(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+  function addChild(el, child) { if (typeof el.appendChild === 'function') el.appendChild(child); }
+
+  function fmtSeconds(v) { return v.toFixed(1).replace('.', ',') + ' s'; }
+
+  function setAge(id, v) {
+    var el = $(id);
+    if (!isNum(v)) {
+      el.textContent = '⚠ sin datos';
+      el.className = 'warn';
+    } else if (v > AGE_WARN_S) {
+      el.textContent = '⚠ ' + fmtSeconds(v) + ' (datos antiguos)';
+      el.className = 'warn';
+    } else {
+      el.textContent = fmtSeconds(v);
+      el.className = '';
+    }
+  }
+
+  function updateRobotPanel() {
+    var st = state.status;
+    $('st-battery').textContent = st && isNum(st.battery_pct) ?
+      st.battery_pct.toFixed(0) + ' %' : 'No disponible';
+    // Nodes: colour AND text (and a symbol) so the state never relies on colour alone.
+    var list = $('st-nodes');
+    clearChildren(list);
+    var nodes = st && st.nodes && typeof st.nodes === 'object' ? st.nodes : null;
+    var names = nodes ? Object.keys(nodes) : [];
+    if (!names.length) {
+      var none = document.createElement('li');
+      none.textContent = 'Sin datos de nodos';
+      addChild(list, none);
+    }
+    names.forEach(function (name) {
+      var raw = nodes[name];
+      var known = typeof raw === 'string' && Object.prototype.hasOwnProperty.call(NODE_LABELS, raw);
+      var key = known ? raw : 'unknown';
+      var li = document.createElement('li');
+      li.className = 'node-' + (key === 'active' ? 'ok' : key === 'inactive' || key === 'unconfigured' ||
+        key === 'unknown' ? 'warn' : 'bad');
+      li.textContent = (key === 'active' ? '✔ ' : '⚠ ') + name + ': ' + NODE_LABELS[key];
+      addChild(list, li);
+    });
+    setAge('st-scan-age', st ? st.scan_age : null);
+    setAge('st-odom-age', st ? st.odom_age : null);
+    $('st-stale').hidden = !st || state.connected;
+    $('st-stale').textContent = st && !state.connected ?
+      'Sin conexión: se muestra el último estado recibido.' : '';
+  }
+
+  // ---- save map ----
+  function canSaveMap() {
+    return !!state.connected && !!state.status && state.status.mode === 'mapping';
+  }
+
+  function setSaveMsg(text, kind) {
+    var m = $('map-save-msg');
+    m.textContent = text;
+    m.className = kind === 'error' ? 'msg msg-error' : kind === 'warn' ? 'msg msg-warn' : 'msg msg-ok';
+    m.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+    m.hidden = !text;
+  }
+
+  function setNameError(text) {
+    var e = $('map-name-error');
+    e.textContent = text;
+    e.hidden = !text;
+    $('map-name').setAttribute('aria-invalid', text ? 'true' : 'false');
+  }
+
+  function updateSaveUi() {
+    var can = canSaveMap();
+    // The confirmation only makes sense while saving is still possible.
+    if (state.overwriteName !== null && (!can || state.saveBusy)) state.overwriteName = null;
+    var asking = state.overwriteName !== null;
+    $('btn-save-map').disabled = !can || state.saveBusy || asking;
+    $('btn-save-map').textContent = state.saveBusy ? 'Guardando…' : 'Guardar mapa';
+    $('btn-save-map').setAttribute('aria-busy', state.saveBusy ? 'true' : 'false');
+    $('overwrite-confirm').hidden = !asking;
+    if (asking) $('overwrite-text').textContent = 'Ya existe un mapa llamado ' + state.overwriteName +
+      '. ¿Sobrescribir?';
+    $('map-save-hint').textContent = !state.connected ?
+      'Sin conexión con el robot: no se puede guardar el mapa.' :
+      !state.status ? 'Disponible cuando se conozca el modo del robot.' :
+      state.status.mode !== 'mapping' ?
+        'Guardar solo está disponible en modo mapeo (mapping); ahora el robot está en navegación (map).' : '';
+  }
+
+  function handleUnauthorized() {
+    disconnect();
+    clearToken();
+    state.token = '';
+    showLogin('Token inválido. Introdúcelo de nuevo.');
+  }
+
+  function saveMap(overwrite) {
+    if (state.saveBusy) return Promise.resolve(null);   // double click: one single request
+    if (!canSaveMap()) { updateSaveUi(); return Promise.resolve(null); }
+    var name = overwrite ? state.overwriteName : $('map-name').value;
+    var problem = mapNameProblem(name);
+    if (problem) { setNameError(problem); return Promise.resolve(null); }
+    if (overwrite && $('map-name').value !== name) {   // the name changed after asking: never overwrite
+      state.overwriteName = null; updateSaveUi(); return Promise.resolve(null);
+    }
+    setNameError('');
+    setSaveMsg('', 'ok');
+    state.saveBusy = true;
+    state.overwriteName = null;
+    updateSaveUi();
+    var body = overwrite ? { name: name, overwrite: true } : { name: name };
+    var done;
+    try {
+      done = postJson('/api/map/save', body, SAVE_TIMEOUT_MS);
+    } catch (e) {
+      done = Promise.resolve({ ok: false, status: 0, data: {} });
+    }
+    return done.then(function (res) {
+      state.saveBusy = false;
+      var code = res.data && res.data.error;
+      if (res.ok) {
+        var saved = res.data && typeof res.data.name === 'string' ? res.data.name : name;
+        if (res.data && res.data.posegraph === false) {
+          setSaveMsg('Guardado: ' + saved + '. El mapa se guardó, pero no se pudo guardar el posegraph ' +
+            '(no podrás ampliarlo). Si estabas sobrescribiendo, el posegraph anterior se ha eliminado.', 'warn');
+        } else {
+          setSaveMsg('Guardado: ' + saved, 'ok');
+        }
+        fetchMaps();
+      } else if (res.status === 409 && code === 'map_exists' && !overwrite) {
+        state.overwriteName = name;   // explicit confirmation required before overwriting
+        setSaveMsg('', 'ok');
+      } else {
+        setSaveMsg(describeSaveError(res.status, code, !!res.timeout), 'error');
+        if (res.timeout) fetchMaps();
+        if (res.status === 401) handleUnauthorized();
+      }
+      updateSaveUi();
+      updateStatus();
+      if (state.overwriteName !== null) $('btn-overwrite-no').focus();
+      return res;
+    });
+  }
+
+  $('btn-save-map').addEventListener('click', function () { saveMap(false); });
+  $('btn-overwrite-yes').addEventListener('click', function () {
+    if (state.overwriteName === null) return;
+    saveMap(true);
+  });
+  $('btn-overwrite-no').addEventListener('click', function () {
+    state.overwriteName = null;
+    setSaveMsg('No se sobrescribió el mapa.', 'ok');
+    updateSaveUi();
+    $('map-name').focus();
+  });
+  $('map-name').addEventListener('input', function () {
+    setNameError('');
+    if (state.overwriteName !== null && $('map-name').value !== state.overwriteName) {
+      state.overwriteName = null;   // a different name: the earlier confirmation no longer applies
+      updateSaveUi();
+    }
+  });
+  $('map-form').addEventListener('submit', function (ev) {
+    if (ev.preventDefault) ev.preventDefault();
+    saveMap(false);
+  });
+
+  // ---- saved maps list (informational only) ----
+  function setMapsState(text) {
+    var el = $('map-list-state');
+    el.textContent = text;
+    el.hidden = !text;
+  }
+
+  function renderMaps(names) {
+    var ul = $('map-list');
+    clearChildren(ul);
+    names.forEach(function (n) {
+      var li = document.createElement('li');
+      li.textContent = n;   // server data: always as text, never as markup
+      addChild(ul, li);
+    });
+  }
+
+  function fetchMaps() {
+    var req = ++state.mapsReq;
+    setMapsState('Cargando mapas guardados…');
+    renderMaps([]);
+    return requestJson('GET', '/api/maps', undefined, REQUEST_TIMEOUT_MS).then(function (res) {
+      if (req !== state.mapsReq) return res;   // a newer request owns the list
+      if (res.ok && res.data && Array.isArray(res.data.maps)) {
+        var names = res.data.maps.filter(function (n) { return typeof n === 'string'; });
+        renderMaps(names);
+        setMapsState(names.length ? '' : 'No hay mapas guardados.');
+      } else {
+        setMapsState(res.status === 401 ? 'Sesión no válida: introduce el token de nuevo.' :
+          'No se pudo cargar la lista de mapas.');
+        if (res.status === 401) handleUnauthorized();
+      }
+      return res;
+    });
+  }
+
+  $('btn-refresh-maps').addEventListener('click', fetchMaps);
+  $('map-box').addEventListener('toggle', function () { if ($('map-box').open) fetchMaps(); });
+
+  // ---- emergency stop and teleoperation ----
+  // Safety rule: when in doubt, stop. PARAR needs no confirmation, never waits for a reply and
+  // does not depend on the WebSocket (the REST call is its redundant path).
+  function wsOpen() { return !!state.ws && state.connected && state.ws.readyState === 1; }
+
+  function wsSend(obj) {
+    try { state.ws.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
+  }
+
+  function navBlocksTeleop() {
+    return !!state.nav && (state.nav.state === 'active' || state.nav.state === 'failed');
+  }
+
+  function teleopBlockReason() {
+    if (!state.connected) return 'Teleoperación bloqueada: sin conexión con el robot';
+    if (state.nav && state.nav.state === 'active') return 'Teleoperación bloqueada: hay una navegación activa';
+    if (state.nav && state.nav.state === 'failed') {
+      return 'Teleoperación bloqueada: la navegación falló y puede seguir activa; cancélala primero';
+    }
+    return '';
+  }
+
+  function canSendTeleop() { return teleop.enabled && wsOpen() && !navBlocksTeleop(); }
+
+  function sendTeleop(vx, wz) {
+    // seq grows even if the send fails, so it can never repeat on a connection.
+    teleop.seq += 1;
+    return wsSend({ type: 'teleop', vx: Math.round(clampAbs(vx, MAX_VX) * 1000) / 1000,
+      wz: Math.round(clampAbs(wz, MAX_WZ) * 1000) / 1000, seq: teleop.seq });
+  }
+
+  function teleopKeyFor(key) {
+    switch (key) {
+      case 'w': case 'W': case 'ArrowUp': return 'fwd';
+      case 's': case 'S': case 'ArrowDown': return 'back';
+      case 'a': case 'A': case 'ArrowLeft': return 'left';
+      case 'd': case 'D': case 'ArrowRight': return 'right';
+      default: return null;
+    }
+  }
+
+  // Current command from the joystick (preferred) or the keys, already saturated.
+  function currentCommand() {
+    var vx = 0, wz = 0;
+    if (teleop.joyId !== null) {
+      vx = -teleop.joy.y * MAX_VX;
+      wz = -teleop.joy.x * MAX_WZ;
+    } else {
+      if (teleop.keys.fwd) vx += MAX_VX;
+      if (teleop.keys.back) vx -= MAX_VX;
+      if (teleop.keys.left) wz += MAX_WZ;
+      if (teleop.keys.right) wz -= MAX_WZ;
+    }
+    return { vx: clampAbs(vx, MAX_VX), wz: clampAbs(wz, MAX_WZ) };
+  }
+
+  function teleopHeld() { return teleop.joyId !== null || Object.keys(teleop.keys).length > 0; }
+
+  function showTeleopMsg(text, isError) {
+    var now = performance.now();
+    if (text === teleop.msgText && now - teleop.msgAt < TELEOP_MSG_THROTTLE_MS) return;  // no flooding
+    teleop.msgText = text;
+    teleop.msgAt = now;
+    var m = $('teleop-msg');
+    m.textContent = text;
+    m.className = isError ? 'msg msg-error' : 'msg msg-ok';
+    m.setAttribute('role', isError ? 'alert' : 'status');
+    m.hidden = !text;
+  }
+
+  function moveKnob() {
+    var k = $('joystick-knob');
+    if (!k || !k.style) return;
+    var r = joyTravel();
+    k.style.transform = teleop.joyId === null ? '' :
+      'translate(' + Math.round(teleop.joy.x * r) + 'px,' + Math.round(teleop.joy.y * r) + 'px)';
+  }
+
+  function joyTravel() {
+    var rc = $('joystick').getBoundingClientRect();
+    return Math.max(1, Math.min(rc.width, rc.height) / 2 - JOY_KNOB_PX);
+  }
+
+  function clearZeroTimer() {
+    if (teleop.zeroTimer !== null) { clearTimeout(teleop.zeroTimer); teleop.zeroTimer = null; }
+  }
+
+  function stopLoop() {
+    if (teleop.timer !== null) { clearInterval(teleop.timer); teleop.timer = null; }
+    teleop.running = false;
+  }
+
+  // Let go of every control and end the loop. With `sendZero` an immediate zero teleop goes out
+  // (twice) but only if sending is allowed; a closed WS or a busy navigation sends nothing.
+  function releaseTeleop(sendZero) {
+    var was = teleop.running || teleopHeld();
+    stopLoop();
+    teleop.joyId = null;
+    teleop.joy = { x: 0, y: 0 };
+    teleop.keys = {};
+    moveKnob();
+    if (was && sendZero && canSendTeleop()) {
+      sendTeleop(0, 0);
+      clearZeroTimer();
+      teleop.zeroTimer = setTimeout(function () {
+        teleop.zeroTimer = null;
+        if (!teleop.running && canSendTeleop()) sendTeleop(0, 0);
+      }, TELEOP_ZERO_REPEAT_MS);
+    }
+    updateTeleopUi();
+  }
+
+  function touchTeleopActivity() {
+    clearTimeout(teleop.idleTimer);
+    teleop.idleTimer = setTimeout(function () {
+      teleop.idleTimer = null;
+      setTeleopEnabled(false, 'Teleoperación desactivada por inactividad.');
+    }, TELEOP_IDLE_MS);
+  }
+
+  function setTeleopEnabled(on, why) {
+    if (on === teleop.enabled) { updateTeleopUi(); return; }
+    if (!on) {
+      releaseTeleop(true);      // zeros first (while still enabled), then switch off
+      clearZeroTimer();
+      clearTimeout(teleop.idleTimer);
+      teleop.idleTimer = null;
+    }
+    teleop.enabled = on;
+    if (on) touchTeleopActivity();
+    $('teleop-toggle').checked = on;
+    if (why) showTeleopMsg(why, false);
+    else if (!on) showTeleopMsg('', false);
+    updateTeleopUi();
+  }
+
+  function teleopConnectionLost() {
+    teleop.seq = 0;
+    if (teleop.enabled) setTeleopEnabled(false, 'Teleoperación desactivada: se perdió la conexión.');
+    else releaseTeleop(false);
+  }
+
+  function teleopTick() {
+    if (!canSendTeleop()) {            // never send; the reason is shown by updateTeleopUi
+      releaseTeleop(false);
+      return;
+    }
+    var c = currentCommand();
+    sendTeleop(c.vx, c.wz);
+    touchTeleopActivity();
+  }
+
+  // A control was pressed: start the 10 Hz loop (first message goes out at once).
+  function startTeleop() {
+    if (!teleop.enabled) return;
+    if (!canSendTeleop()) {
+      releaseTeleop(false);
+      showTeleopMsg(teleopBlockReason() || 'Teleoperación no disponible.', true);
+      return;
+    }
+    clearZeroTimer();
+    if (teleop.running) return;
+    teleop.running = true;
+    teleopTick();
+    if (teleop.running) teleop.timer = setInterval(teleopTick, TELEOP_PERIOD_MS);
+    updateTeleopUi();
+  }
+
+  function handleServerError(msg) {
+    switch (msg.code) {
+      case 'teleop_rejected':
+        releaseTeleop(false);
+        showTeleopMsg('Teleoperación rechazada: otra sesión controla el robot o hay navegación activa', true);
+        break;
+      case 'teleop_disabled':
+        releaseTeleop(false);
+        showTeleopMsg('La teleoperación está desactivada en el robot', true);
+        setTeleopEnabled(false, 'La teleoperación está desactivada en el robot');
+        break;
+      case 'invalid_teleop':
+      case 'unsupported_message':
+        releaseTeleop(false);
+        showTeleopMsg('El robot no aceptó el comando de teleoperación.', true);
+        break;
+      case 'stop_unavailable':
+        showStopStatus('El robot no pudo ejecutar la parada por WebSocket; pulsa de nuevo.', true);
+        break;
+      default: break;
+    }
+  }
+
+  function updateTeleopUi() {
+    if (teleop.enabled && (!state.connected || navBlocksTeleop()) && (teleop.running || teleopHeld())) {
+      releaseTeleop(false);   // re-enters here once, with nothing held
+      return;
+    }
+    var reason = teleop.enabled ? teleopBlockReason() : '';
+    $('teleop-hint').textContent = reason;
+    $('joystick').hidden = !teleop.enabled;
+    $('st-teleop').textContent = !teleop.enabled ? 'Inactiva' :
+      (reason ? 'Activa (bloqueada)' : teleop.running ? 'Activa (enviando)' : 'Activa');
+    $('st-limits').textContent = '≤ ' + MAX_VX.toFixed(1).replace('.', ',') + ' m/s, ≤ ' +
+      MAX_WZ.toFixed(1).replace('.', ',') + ' rad/s';
+  }
+
+  $('teleop-toggle').addEventListener('change', function () {
+    setTeleopEnabled(!!$('teleop-toggle').checked, '');
+  });
+
+  // Joystick (mouse and touch via pointer events; one finger owns it).
+  function joyFromEvent(ev) {
+    var rc = $('joystick').getBoundingClientRect();
+    var r = joyTravel();
+    var x = (ev.clientX - (rc.left + rc.width / 2)) / r, y = (ev.clientY - (rc.top + rc.height / 2)) / r;
+    var m = Math.hypot(x, y);
+    if (!isNum(m)) { x = 0; y = 0; } else if (m > 1) { x /= m; y /= m; }
+    teleop.joy = { x: x, y: y };
+    moveKnob();
+  }
+  var joystick = $('joystick');
+  joystick.addEventListener('pointerdown', function (ev) {
+    if (!teleop.enabled || teleop.joyId !== null) return;
+    if (ev.preventDefault) ev.preventDefault();
+    try { joystick.setPointerCapture(ev.pointerId); } catch (e) { /* ignore */ }
+    teleop.joyId = ev.pointerId;
+    teleop.keys = {};
+    joyFromEvent(ev);
+    startTeleop();
+  });
+  joystick.addEventListener('pointermove', function (ev) {
+    if (teleop.joyId === null || ev.pointerId !== teleop.joyId) return;
+    joyFromEvent(ev);
+  });
+  function joyEnd(ev) {
+    if (teleop.joyId === null || (ev && ev.pointerId !== undefined && ev.pointerId !== teleop.joyId)) return;
+    releaseTeleop(true);
+  }
+  joystick.addEventListener('pointerup', joyEnd);
+  joystick.addEventListener('pointercancel', joyEnd);
+  joystick.addEventListener('lostpointercapture', joyEnd);
+  joystick.addEventListener('touchcancel', function () { releaseTeleop(true); });
+
+  // Keyboard: WASD / arrows drive; Escape is always PARAR; Space is PARAR only
+  // when focus is not on an interactive control (there it keeps its native behaviour).
+  function isTextEntry(t) {
+    if (!t || !t.tagName) return false;
+    if (t.tagName === 'TEXTAREA' || t.tagName === 'SELECT') return true;
+    return t.tagName === 'INPUT' && t.type !== 'checkbox' && t.type !== 'button';
+  }
+  function isInteractive(t) {
+    if (!t || !t.tagName) return false;
+    var tag = t.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON' ||
+        tag === 'SUMMARY') return true;
+    if (tag === 'A' && t.href) return true;
+    if (t.isContentEditable) return true;
+    var role = t.getAttribute ? t.getAttribute('role') : null;
+    return role === 'button' || role === 'checkbox' || role === 'switch';
+  }
+  function isSpace(k) { return k === ' ' || k === 'Spacebar'; }
+  window.addEventListener('keydown', function (ev) {
+    var key = ev.key, t = ev.target;
+    if (key === 'Escape' || (isSpace(key) && !isInteractive(t))) {
+      if (ev.preventDefault) ev.preventDefault();
+      if (!ev.repeat) emergencyStop();
+      return;
+    }
+    var k = teleopKeyFor(key);
+    if (!k || !teleop.enabled || isTextEntry(t) || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    if (ev.preventDefault) ev.preventDefault();
+    if (ev.repeat && !teleop.keys[k]) return;   // a repeat after PARAR/release must not restart
+    teleop.keys[k] = true;
+    teleop.joyId = null;
+    startTeleop();
+  });
+  window.addEventListener('keyup', function (ev) {
+    if (isSpace(ev.key) && ev.preventDefault && !isInteractive(ev.target)) ev.preventDefault();
+    var k = teleopKeyFor(ev.key);
+    if (!k || !teleop.keys[k]) return;
+    delete teleop.keys[k];
+    if (!teleopHeld()) releaseTeleop(true);
+  });
+  // Focus loss / hidden tab / touch cancel: let go at once.
+  window.addEventListener('blur', function () { releaseTeleop(true); });
+  window.addEventListener('touchcancel', function () { releaseTeleop(true); });
+  if (document.addEventListener) {
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden || document.visibilityState === 'hidden') releaseTeleop(true);
+    });
+  }
+
+  // PARAR: WS stop AND POST /api/stop, both fired right away and independent of each other.
+  var stopStatusTimer = null;
+  function showStopStatus(text, isError) {
+    var el = $('stop-status');
+    el.textContent = text;
+    el.className = isError ? 'msg-error' : '';
+    el.setAttribute('role', isError ? 'alert' : 'status');
+    el.hidden = !text;
+    clearTimeout(stopStatusTimer);
+    stopStatusTimer = null;
+    if (text && !isError) {
+      stopStatusTimer = setTimeout(function () { stopStatusTimer = null; el.hidden = true; }, STOP_STATUS_MS);
+    }
+  }
+
+  function emergencyStop() {
+    // 1) cancel any local teleop (no zero teleop: the stop below supersedes it)
+    clearZeroTimer();
+    releaseTeleop(false);
+    // 2) WS stop (if the link is up) and 3) REST stop, without waiting for each other
+    if (wsOpen()) wsSend({ type: 'stop' });
+    showStopStatus('Parada enviada', false);
+    var done;
+    try {
+      done = postJson('/api/stop', undefined, CANCEL_TIMEOUT_MS);
+    } catch (e) {
+      done = Promise.resolve({ ok: false, status: 0, data: {} });
+    }
+    done.then(function (res) {
+      if (res.ok) return;
+      var why = res.timeout || res.status === 0 ? 'No se pudo enviar la parada por HTTP' :
+        describeApiError(res.status, res.data && res.data.error).replace(/\.$/, '');
+      showStopStatus('Error: ' + why + '. ¡Pulsa de nuevo!', true);
+    });
+  }
+  $('btn-stop-all').addEventListener('click', emergencyStop);
+
+  updateTeleopUi();
+
   // ---- main loop ----
   function frame() {
     var now = performance.now();
@@ -976,6 +1645,7 @@
     requestAnimationFrame(frame);
   }
 
+  loadLayers();
   resize();
   setInterval(updateStatus, 500);
   state.token = loadToken();

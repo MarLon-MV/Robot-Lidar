@@ -2,6 +2,8 @@
 # The token below is a PLACEHOLDER. Never commit a real token: put the real one in
 # param/web.local.yaml (git-ignored) or in the MTRB_WEB_TOKEN environment variable.
 # LAN only: do not expose this port to the internet.
+# The node refuses to start with the example token or a token shorter than 16 characters.
+# No TLS here: the token travels in clear text; use an isolated network or a TLS reverse proxy.
 # Token priority (first non-empty wins):
 #   1. environment variable MTRB_WEB_TOKEN
 #   2. parameter auth.token loaded by the launch (web_params_file)
@@ -15,6 +17,7 @@ mtrb_web_bridge:
       pose: 10.0                # Hz
       scan: 5.0                 # Hz
       status: 1.0               # Hz
+      lifecycle: 0.5            # Hz, lifecycle polling for `status.nodes` (0.05 .. 0.5)
     teleop:
       max_vx: 0.2               # m/s     INITIAL: tune on the robot
       max_wz: 0.8               # rad/s   INITIAL: tune on the robot
@@ -26,11 +29,26 @@ mtrb_web_bridge:
       max_range: 12.0           # m
     plan:
       max_points: 200
+    status:
+      # Nav2 lifecycle nodes shown in the `status` message. The localization node of the mode
+      # (map_server + amcl, or slam_toolbox) is added automatically. Names relative to /r2.
+      nodes: [controller_server, planner_server, bt_navigator, behavior_server, velocity_smoother]
+    # Directory for POST /api/map/save and GET /api/maps. '' = ~/mtrb_maps (created if missing;
+    # if HOME is undefined saving answers 500). Otherwise an absolute path; only [A-Za-z0-9_./-]
+    # is accepted (slam_toolbox hands the path to a shell). The name `map` is reserved.
+    # Load a saved map with mode:=map map:=<dir>/<name>.yaml
+    map_dir: ''
+    maps:
+      min_free_mb: 200          # MB of free disk required to save a map (507 below this)
+      min_interval_s: 5.0       # s between two map saves (429 save_rate_limited)
     limits:
       max_clients: 5
       max_ws_bytes: 4096
     auth:
-      token: CHANGE-ME-example-token   # placeholder, see header
+      token: CHANGE-ME-example-token   # placeholder: the node REFUSES to start with it
+      allow_example_token: false       # development only: accept the placeholder or a token
+                                       # shorter than 16 chars, loopback host only (127.0.0.1,
+                                       # ::1, localhost). Never set it to true on the robot.
     dock:                       # overridden by the launch file (dock_x/dock_y/dock_yaw)
       x: 0.0                    # m
       y: 0.0                    # m

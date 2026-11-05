@@ -25,6 +25,11 @@
         <label class="toggle"><input id="layer-scan" type="checkbox" checked> Scan</label>
         <label class="toggle"><input id="layer-plan" type="checkbox" checked> Ruta</label>
         <label class="toggle"><input id="layer-dock" type="checkbox" checked disabled> Dock</label>
+        <label class="toggle"><input id="layer-trail" type="checkbox"> Trayectoria</label>
+      </div>
+      <div id="joystick" tabindex="0" role="group" hidden
+           aria-label="Joystick de teleoperación. Con el teclado usa W A S D o las flechas.">
+        <div id="joystick-knob" aria-hidden="true"></div>
       </div>
       <div id="pending-bar" hidden>
         <span id="pending-text"></span>
@@ -49,15 +54,62 @@
         <p id="offline-hint" class="hint" hidden></p>
         <p id="msg" class="msg" role="status" aria-live="polite" hidden></p>
       </div>
-      <dl>
-        <dt>Modo</dt><dd id="st-mode">-</dd>
-        <dt>Batería</dt><dd id="st-battery">-</dd>
-        <dt>Navegación</dt><dd id="st-nav">-</dd>
-        <dt>Pose</dt><dd id="st-pose">-</dd>
-        <dt>Mapa</dt><dd id="st-map">-</dd>
-      </dl>
+      <div id="teleop-box">
+        <label class="toggle"><input id="teleop-toggle" type="checkbox"> Activar teleoperación</label>
+        <p id="teleop-hint" class="hint" role="status" aria-live="polite"></p>
+        <p id="teleop-msg" class="msg" role="status" aria-live="polite" hidden></p>
+      </div>
+      <details id="status-box" open>
+        <summary>Estado del robot</summary>
+        <p id="st-stale" class="hint" role="status" hidden></p>
+        <dl>
+          <dt>Conexión</dt><dd id="st-conn">-</dd>
+          <dt>Modo</dt><dd id="st-mode">-</dd>
+          <dt>Batería</dt><dd id="st-battery">-</dd>
+          <dt>Navegación</dt><dd id="st-nav">-</dd>
+          <dt>Nodos</dt><dd><ul id="st-nodes" class="nodes"></ul></dd>
+          <dt>Edad del scan</dt><dd id="st-scan-age">-</dd>
+          <dt>Edad de odom</dt><dd id="st-odom-age">-</dd>
+          <dt>Pose</dt><dd id="st-pose">-</dd>
+          <dt>Teleoperación</dt><dd id="st-teleop">Inactiva</dd>
+          <dt>Límites</dt><dd id="st-limits">-</dd>
+          <dt>Mapa</dt><dd id="st-map">-</dd>
+        </dl>
+      </details>
+      <details id="map-box">
+        <summary>Mapas</summary>
+        <form id="map-form" autocomplete="off" novalidate>
+          <label for="map-name">Nombre del mapa</label>
+          <input id="map-name" type="text" maxlength="40" autocomplete="off" spellcheck="false"
+                 aria-describedby="map-name-help map-name-error map-save-hint">
+          <p id="map-name-help" class="hint">Letras sin tildes, números, guion (-) y guion bajo (_); máximo 40; no puede empezar por guion ni llamarse «map».</p>
+          <p id="map-name-error" class="msg msg-error" role="alert" hidden></p>
+          <button id="btn-save-map" type="button" class="btn-primary" disabled>Guardar mapa</button>
+          <span id="overwrite-confirm" role="group" aria-label="Confirmar sobrescritura" hidden>
+            <span id="overwrite-text"></span>
+            <button id="btn-overwrite-yes" type="button" class="btn-primary">Sí, sobrescribir</button>
+            <button id="btn-overwrite-no" type="button">No</button>
+          </span>
+          <p id="map-save-hint" class="hint"></p>
+          <p id="map-save-msg" class="msg" role="status" hidden></p>
+        </form>
+        <h2 class="subhead">Mapas guardados</h2>
+        <button id="btn-refresh-maps" type="button" class="btn-small">Actualizar lista</button>
+        <p id="map-list-state" class="hint" role="status">Abre este panel para ver los mapas.</p>
+        <ul id="map-list" class="maps"></ul>
+        <p id="map-load-note" class="hint">Para usar un mapa guardado: mode:=map map:=&lt;carpeta&gt;/&lt;nombre&gt;.yaml,
+          donde &lt;carpeta&gt; es la carpeta de mapas del robot (por defecto ~/mtrb_maps).</p>
+      </details>
     </aside>
   </main>
+
+  <div id="stop-bar">
+    <p id="stop-status" role="status" hidden></p>
+    <button id="btn-stop-all" type="button" role="button" class="btn-parar"
+            aria-label="PARAR: detener el robot ahora (tecla Escape)"
+            title="Atajo: Escape">PARAR</button>
+    <p id="stop-help" class="hint">Escape = PARAR</p>
+  </div>
 
   <div id="login" hidden>
     <form id="login-form" autocomplete="off">

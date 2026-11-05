@@ -4,6 +4,8 @@ from array import array
 import json
 import logging
 import math
+import os
+import pwd
 import threading
 from types import SimpleNamespace as NS
 from unittest import mock
@@ -73,18 +75,29 @@ def test_select_token_all_empty_returns_empty():
         assert node._select_token('/x') == ''
 
 
+# Parameter defaults of the teleop section (mirror param/web.yaml and PARAMETERS).
+TELEOP_DEFAULTS = {'teleop.max_vx': 0.2, 'teleop.max_wz': 0.8, 'teleop.timeout_ms': 300,
+                   'teleop.enabled': True}
+
+
 def _fake_settings(self):
     """Stand-in for _read_settings (token/port tests only; see the _read_settings tests below)."""
     self._max_clients = 5
     self._max_ws_bytes = 4096
     self._dock = (0.0, 0.0, 0.0)
+    self._map_dir = '/share/map'  # phase 5: __init__ hands it to create_app
+    self._map_min_free_mb = 200   # security fixes: quotas handed to create_app
+    self._map_min_interval_s = 5.0
 
 
 def _init_node(params, token_result=SECRET):
     """Run the real __init__ with ROS pieces replaced by doubles."""
-    values = {'auth.token': '', 'host': '127.0.0.1', 'port': 8080}
+    values = {'auth.token': '', 'host': '127.0.0.1', 'port': 8080,
+              'auth.allow_example_token': False}
+    values.update(TELEOP_DEFAULTS)  # _read_teleop_settings runs for real in __init__
     values.update(params)
     logger = mock.Mock()
+    create_app_mock = mock.Mock(return_value=object())
     with mock.patch.object(bridge.Node, '__init__', lambda self, name: None), \
             mock.patch.object(bridge.MtrbWebBridge, 'declare_parameter',
                               create=True, new=lambda self, *a, **k: None), \
@@ -96,8 +109,9 @@ def _init_node(params, token_result=SECRET):
             mock.patch.object(bridge, 'resolve_token', return_value=token_result), \
             mock.patch.object(bridge.MtrbWebBridge, '_read_settings', new=_fake_settings), \
             mock.patch.object(bridge.MtrbWebBridge, '_init_ros_io', new=lambda self: None), \
-            mock.patch.object(bridge, 'create_app', return_value=object()):
+            mock.patch.object(bridge, 'create_app', new=create_app_mock):
         node = bridge.MtrbWebBridge()
+    node.create_app_mock = create_app_mock   # kept off the logger: it receives the token
     return node, logger
 
 
@@ -116,14 +130,6 @@ def test_empty_host_raises_config_error(host):
 def test_no_token_anywhere_raises_config_error():
     with pytest.raises(bridge.ConfigError):
         _init_node({}, token_result='')
-
-
-def test_placeholder_token_logs_warning_without_leaking_token():
-    placeholder = 'CHANGE-ME-abc123'
-    node, logger = _init_node({'auth.token': placeholder})
-    assert logger.warning.called
-    logged = ' '.join(str(c) for c in logger.method_calls)
-    assert placeholder not in logged
 
 
 def test_real_token_does_not_warn_and_is_never_logged(caplog):
@@ -162,6 +168,13 @@ def make_bridge(now=100.0):
     node._scan_max_range_m = 12.0
     node._mode = 'map'
     node._dock = (0.0, 0.0, 0.0)
+    # Phase 5: _broadcast_status reads the lifecycle snapshot. No watched nodes here (so
+    # `nodes` is {}); the lifecycle behaviour has its own tests further down.
+    node._status_nodes = ()
+    node._lifecycle_period_s = 2.0
+    node.create_subscription = node.create_timer = mock.Mock()
+    node.create_client = mock.Mock()
+    node._init_status_io()
     node.tf = None  # (x, y, yaw, stamp_s) or exception
     node._lookup = lambda target, source: node.tf
     node.channel = node.hub.add_client(lambda: None)
@@ -483,6 +496,12 @@ VALID_SETTINGS = {
     'scan.max_points': 360, 'scan.min_range': 0.15, 'scan.max_range': 12.0,
     'plan.max_points': 200, 'limits.max_clients': 5, 'limits.max_ws_bytes': 4096,
     'mode': 'map', 'dock.x': 0.0, 'dock.y': 0.0, 'dock.yaw': 0.0,
+    # Phase 5 parameters (mirror param/web.yaml).
+    'rates.lifecycle': 0.5, 'map_dir': '/maps',
+    # Security fixes (mirror param/web.yaml).
+    'maps.min_free_mb': 200, 'maps.min_interval_s': 5.0, 'auth.allow_example_token': False,
+    'status.nodes': ['controller_server', 'planner_server', 'bt_navigator',
+                     'behavior_server', 'velocity_smoother'],
 }
 
 
@@ -491,6 +510,8 @@ def _settings_node(**overrides):
     values.update(overrides)
     node = object.__new__(bridge.MtrbWebBridge)
     node.get_parameter = lambda name: FakeParam(values[name])
+    node.logger = mock.Mock()
+    node.get_logger = lambda: node.logger
     return node
 
 
@@ -582,10 +603,24 @@ def test_read_settings_dock_at_the_limit_is_accepted():
 def _io_node():
     node = object.__new__(bridge.MtrbWebBridge)
     node._pose_period_s, node._scan_period_s, node._status_period_s = 0.1, 0.2, 1.0
+    node._status_nodes = ('map_server', 'amcl')   # phase 5: lifecycle clients to create
+    node._lifecycle_period_s = 2.0
     node.create_subscription = mock.Mock()
     node.create_timer = mock.Mock()
-    node.create_publisher = mock.Mock()
-    node.create_client = mock.Mock()
+    node.created_publishers = {}  # topic -> the object create_publisher returned for it
+
+    def create_publisher(msg_type, topic, depth):
+        node.created_publishers[topic] = mock.Mock(name=f'publisher-{topic}')
+        return node.created_publishers[topic]
+
+    node.create_publisher = mock.Mock(side_effect=create_publisher)
+    node.created_clients = {}  # service name -> the client create_client returned for it
+
+    def create_client(srv_type, name, **kwargs):
+        node.created_clients[name] = mock.Mock(name=f'client-{name}')
+        return node.created_clients[name]
+
+    node.create_client = mock.Mock(side_effect=create_client)
     node._publish_nav = mock.Mock()  # the initial `idle` message is checked separately
     with mock.patch.object(bridge, 'Buffer'), mock.patch.object(bridge, 'TransformListener'), \
             mock.patch.object(bridge, 'ActionClient') as action_client:
@@ -606,10 +641,11 @@ def test_init_ros_io_map_subscription_is_reliable_transient_local_depth_1():
     assert qos.durability == bridge.DurabilityPolicy.TRANSIENT_LOCAL
 
 
-def test_init_ros_io_subscribes_to_the_four_expected_topics_only():
+def test_init_ros_io_subscribes_to_the_five_expected_topics_only():
     node = _io_node()
     topics = sorted(c.args[1] for c in node.create_subscription.call_args_list)
-    assert topics == ['battery_state', 'map', 'plan', 'scan']
+    # Phase 5 adds `odom` (only its arrival time is used for status.odom_age).
+    assert topics == ['battery_state', 'map', 'odom', 'plan', 'scan']
 
 
 def test_init_ros_io_scan_uses_sensor_data_qos():
@@ -627,15 +663,56 @@ def test_init_ros_io_timer_periods_and_callbacks():
         '_broadcast_status': pytest.approx(1.0),    # 1 Hz
         '_broadcast_map': pytest.approx(bridge.MAP_PERIOD_S),
         '_nav_watchdog': pytest.approx(bridge.NAV_WATCHDOG_PERIOD_S),
+        '_teleop_watchdog': pytest.approx(0.02),    # 20 ms << teleop.timeout_ms
+        '_poll_lifecycle': pytest.approx(2.0),      # phase 5: rates.lifecycle 0.5 Hz
     }
     assert bridge.MAP_PERIOD_S == 1.0
+    assert bridge.TELEOP_WATCHDOG_PERIOD_S == 0.02
 
 
-def test_init_ros_io_creates_only_the_initialpose_publisher():
+def test_init_ros_io_teleop_watchdog_has_its_own_callback_group():
+    node = _io_node()
+    by_name = {c.args[1].__name__: c for c in node.create_timer.call_args_list}
+    group = by_name['_teleop_watchdog'].kwargs.get('callback_group')
+    assert isinstance(group, bridge.MutuallyExclusiveCallbackGroup)
+    for name, call in by_name.items():
+        # The others stay in the node's default group, except the lifecycle polling (phase 5)
+        # which has a group of its own (tested in the lifecycle section).
+        if name not in ('_teleop_watchdog', '_poll_lifecycle'):
+            assert 'callback_group' not in call.kwargs, name
+
+
+def test_init_ros_io_creates_exactly_the_initialpose_and_cmd_vel_nav_publishers():
+    node = _io_node()
+    created = {c.args[1]: c.args[0] for c in node.create_publisher.call_args_list}
+    assert len(node.create_publisher.call_args_list) == 2
+    assert set(created) == {'initialpose', 'cmd_vel_nav'}
+    assert created['initialpose'] is bridge.PoseWithCovarianceStamped
+    assert created['cmd_vel_nav'] is bridge.Twist
+    assert bridge.Twist.__name__ == 'Twist'  # geometry_msgs/Twist, NOT TwistStamped
+    assert not hasattr(bridge, 'TwistStamped')
+
+
+def test_init_ros_io_never_creates_a_bare_cmd_vel_publisher():
     node = _io_node()
     topics = [c.args[1] for c in node.create_publisher.call_args_list]
-    assert topics == ['initialpose']
-    assert node.create_publisher.call_args.args[0] is bridge.PoseWithCovarianceStamped
+    assert 'cmd_vel' not in topics
+    assert all(not t.lstrip('/').rstrip('/').endswith('/cmd_vel') for t in topics)
+    assert all(t == 'cmd_vel_nav' or t == 'initialpose' for t in topics)
+
+
+def test_init_ros_io_keeps_the_cmd_vel_nav_publisher_for_the_teleop():
+    node = _io_node()
+    assert node._cmd_vel_nav_pub is node.created_publishers['cmd_vel_nav']
+    assert node._initial_pose_pub is node.created_publishers['initialpose']
+    assert node._cmd_vel_nav_pub is not node._initial_pose_pub
+
+
+def test_init_ros_io_cmd_vel_nav_name_is_relative_so_it_lives_in_the_node_namespace():
+    node = _io_node()
+    call = [c for c in node.create_publisher.call_args_list if 'cmd_vel_nav' in c.args][0]
+    assert call.args[1] == 'cmd_vel_nav'
+    assert not call.args[1].startswith('/')
 
 
 def test_init_ros_io_creates_the_navigate_to_pose_action_client_with_relative_name():
@@ -647,11 +724,13 @@ def test_init_ros_io_creates_the_navigate_to_pose_action_client_with_relative_na
 
 def test_init_ros_io_creates_the_cancel_all_client_with_type_and_exact_service_name():
     node = _io_node()
-    node.create_client.assert_called_once()
-    args = node.create_client.call_args.args
-    assert args[0] is bridge.CancelGoal
-    assert args[1] == 'navigate_to_pose/_action/cancel_goal'
-    assert node._cancel_all_client is node.create_client.return_value
+    # Phase 5: create_client is also used for the lifecycle and slam_toolbox clients, so the
+    # cancel-all client is looked up by its service name (exactly one such client).
+    calls = [c for c in node.create_client.call_args_list
+             if c.args[1] == 'navigate_to_pose/_action/cancel_goal']
+    assert len(calls) == 1
+    assert calls[0].args[0] is bridge.CancelGoal
+    assert node._cancel_all_client is node.created_clients['navigate_to_pose/_action/cancel_goal']
 
 
 def test_cancel_all_client_is_none_before_ros_io_is_created():
@@ -661,6 +740,7 @@ def test_cancel_all_client_is_none_before_ros_io_is_created():
 def test_init_ros_io_publishes_idle_nav_state():
     node = object.__new__(bridge.MtrbWebBridge)
     node._pose_period_s, node._scan_period_s, node._status_period_s = 0.1, 0.2, 1.0
+    node._status_nodes, node._lifecycle_period_s = (), 2.0  # phase 5 attributes
     node.create_subscription = node.create_timer = node.create_publisher = mock.Mock()
     node.create_client = mock.Mock()
     node._publish_nav = mock.Mock()
@@ -688,7 +768,7 @@ def _own_publisher_topics(node):
     return [t for t in topics if t.rstrip('/').split('/')[-1] not in RCLPY_INTERNAL_TOPICS]
 
 
-def test_real_rclpy_node_only_publishes_initialpose_and_has_expected_timers(monkeypatch):
+def test_real_rclpy_node_publishes_only_initialpose_and_cmd_vel_nav_with_timers(monkeypatch):
     """
     Real rclpy node (SOLO Pi/ROS: only meaningful with the package installed).
 
@@ -709,14 +789,18 @@ def test_real_rclpy_node_only_publishes_initialpose_and_has_expected_timers(monk
             pytest.skip('mtrb_bringup is not installed')
         own = _own_publisher_topics(node)
         names = {t.rstrip('/').split('/')[-1] for t in own}
-        assert names == {'initialpose'}, f'only initialpose may be published, found {own}'
-        assert len(own) == 1
-        for topic in own:  # explicit guard for the safety-critical topics
-            assert not topic.lstrip('/').startswith(('cmd_vel', 'cmd_vel_nav'))
+        assert names == {'initialpose', 'cmd_vel_nav'}, (
+            f'only initialpose and cmd_vel_nav may be published, found {own}')
+        assert len(own) == 2
+        for topic in own:  # explicit guard: the web NEVER publishes on a bare cmd_vel
+            assert topic.rstrip('/').split('/')[-1] != 'cmd_vel', topic
+        nav_topics = [t for t in own if t.rstrip('/').split('/')[-1] == 'cmd_vel_nav']
+        assert len(nav_topics) == 1 and nav_topics[0].endswith('/cmd_vel_nav')
         # Node.timers: rclpy Jazzy exposes Timer.timer_period_ns (int); fall back to the
         # handle's period if a distro lacks the property (defensive, API varies by distro).
         periods = sorted(round(t.timer_period_ns / 1e9, 3) for t in node.timers)
-        assert periods == [0.1, 0.2, 0.5, 1.0, 1.0]
+        # Phase 5 adds the lifecycle polling timer: rates.lifecycle 0.5 Hz = 2.0 s.
+        assert periods == [0.02, 0.1, 0.2, 0.5, 1.0, 1.0, 2.0]
         # Node.subscriptions: Subscription.topic_name (fully qualified) and .qos_profile.
         by_topic = {s.topic_name.rstrip('/').split('/')[-1]: s for s in node.subscriptions}
         assert {'map', 'scan', 'plan', 'battery_state'} <= set(by_topic)
@@ -1500,10 +1584,46 @@ def test_on_map_invalid_map_clears_the_stored_grid(bad):
     assert node.store.grid() is None
 
 
-def test_node_exposes_no_cmd_vel_publisher_in_source():
+def _publisher_topics_in_source():
+    """Topic argument (literal) of every create_publisher(...) call found in the source."""
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(bridge))
+    topics = []
+    for call in ast.walk(tree):
+        if isinstance(call, ast.Call) and getattr(call.func, 'attr', None) == 'create_publisher':
+            topic = call.args[1]
+            assert isinstance(topic, ast.Constant), 'publisher topic must be a literal'
+            topics.append(topic.value)
+    return topics
+
+
+def test_node_source_never_publishes_on_a_bare_cmd_vel():
+    import inspect
+    import re
+    source = inspect.getsource(bridge)
+    assert re.search(r"create_publisher\([^)]*['\"]cmd_vel['\"]", source) is None
+    assert re.search(r"create_publisher\([^)]*['\"]/?cmd_vel['\"]", source) is None
+
+
+def test_the_only_cmd_vel_publisher_in_the_source_is_cmd_vel_nav():
+    topics = _publisher_topics_in_source()
+    assert sorted(topics) == ['cmd_vel_nav', 'initialpose']
+    assert [t for t in topics if t.startswith('cmd_vel')] == ['cmd_vel_nav']
+
+
+def test_node_source_has_no_literal_cmd_vel_topic_and_no_twist_stamped():
+    import ast
     import inspect
     source = inspect.getsource(bridge)
-    assert 'cmd_vel' not in source
+    tree = ast.parse(source)
+    literals = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant)
+                and isinstance(n.value, str)]
+    assert 'cmd_vel' not in literals and '/cmd_vel' not in literals
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    names |= {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+              for a in n.names}
+    assert 'TwistStamped' not in names and 'Twist' in names
 
 
 # --- Fail-safe handling of accepted goals without a Nav2 result (phase 3 safety fixes) --------
@@ -2684,3 +2804,3508 @@ def test_test_doubles_do_not_imitate_the_private_cancel_goal_client():
     node = make_nav_bridge()
     assert not hasattr(node._nav_client, '_cancel_goal_client')
     assert not hasattr(node, '_cancel_goal_client')
+
+
+# --- cancel-all: answers are attributed to the stamp they were sent for ----------------------
+# Regression: a late answer to an OLDER cancel-all must not clear the pending cancel-all of a
+# newer decision (it would stop the retries and leave a possibly running goal uncancelled).
+
+def _arm_t2_after_t1_was_sent(node):
+    """cancel() at t1 (sent), send_goal, service lost, goal released by timeout -> pending t2.
+
+    Returns (t1_stamp_ns, t2_stamp_ns). The cancel-all of t2 is armed but NOT sent.
+    """
+    client = cancel_client(node)
+    node.cancel()                                   # t1: sent (futures[0])
+    t1 = node._cancel_all['stamp_ns']
+    node.clock[0] += 0.5
+    node.send_goal(1.0, 2.0, 0.5)                   # clears the pending cancel-all of t1
+    assert node._cancel_all is None
+    client.ready = False                            # the service goes down
+    node.clock[0] += bridge.NAV_RESPONSE_TIMEOUT_S + 0.1
+    node._nav_watchdog()                            # no handle: released, arms cancel-all t2
+    assert node._nav_token is None
+    t2 = node._cancel_all['stamp_ns']
+    assert t2 > t1
+    assert len(client.requests) == 1                # t2 not sent: service not ready
+    return t1, t2
+
+
+def test_ca_late_answer_of_an_older_cancel_all_does_not_clear_the_newer_pending():
+    node = make_nav_bridge(now=100.0)
+    client = cancel_client(node)
+    t1, t2 = _arm_t2_after_t1_was_sent(node)
+    client.answer(0, bridge.CANCEL_ERROR_NONE)      # LATE answer to t1
+    assert node._cancel_all is not None
+    assert node._cancel_all['stamp_ns'] == t2
+    assert node._cancel_all['attempts'] == 0
+    client.ready = True                             # service back: t2 must still be sent
+    tick(node, 1.0)
+    assert len(client.requests) == 2
+    assert_cancel_all_request(client.requests[1], t2)
+
+
+@pytest.mark.parametrize('code', [
+    bridge.CANCEL_ERROR_UNKNOWN_GOAL_ID, bridge.CANCEL_ERROR_GOAL_TERMINATED,
+    bridge.CANCEL_ERROR_REJECTED, 99])
+def test_ca_stale_answer_with_any_code_leaves_the_newer_pending_untouched(code):
+    node = make_nav_bridge(now=100.0)
+    client = cancel_client(node)
+    _, t2 = _arm_t2_after_t1_was_sent(node)
+    before = dict(node._cancel_all)
+    client.answer(0, code)
+    assert node._cancel_all == before
+    assert node._cancel_all['stamp_ns'] == t2
+
+
+@pytest.mark.parametrize('code', [bridge.CANCEL_ERROR_REJECTED, 99])
+def test_ca_stale_rejected_answer_gives_no_retry_warning_and_no_noise(code):
+    node = make_nav_bridge(now=100.0)
+    client = cancel_client(node)
+    _arm_t2_after_t1_was_sent(node)
+    warnings_before = len(_warnings(node))
+    errors_before = len(_errors(node))
+    client.answer(0, code)
+    assert len(_warnings(node)) == warnings_before
+    assert len(_errors(node)) == errors_before
+    assert not [m for m in _warnings(node) if 'rejected' in m or 'will retry' in m]
+
+
+def test_ca_stale_answer_with_exception_is_ignored_without_warning():
+    node = make_nav_bridge(now=100.0)
+    client = cancel_client(node)
+    _, t2 = _arm_t2_after_t1_was_sent(node)
+    warnings_before = len(_warnings(node))
+    client.futures[0].resolve(error=RuntimeError('lost'))
+    assert node._cancel_all is not None and node._cancel_all['stamp_ns'] == t2
+    assert len(_warnings(node)) == warnings_before
+    assert not [m for m in _warnings(node) if 'No cancel-all answer' in m]
+
+
+def test_ca_stale_answer_is_logged_at_debug_and_not_as_info():
+    node = make_nav_bridge(now=100.0)
+    client = cancel_client(node)
+    t1, _ = _arm_t2_after_t1_was_sent(node)
+    info_before = len(node.logger.info.call_args_list)
+    client.answer(0, bridge.CANCEL_ERROR_NONE)
+    assert len(node.logger.info.call_args_list) == info_before
+    assert node.logger.debug.call_count == 1
+    assert 'stale' in node.logger.debug.call_args[0][0].lower()
+    assert str(t1) in node.logger.debug.call_args[0][0]
+
+
+def test_ca_stale_answer_does_not_read_the_future_result():
+    node = make_nav_bridge(now=100.0)
+    _arm_t2_after_t1_was_sent(node)
+    future = mock.Mock()
+    future.result.side_effect = AssertionError('a stale answer must not be inspected')
+    node._on_cancel_all_response(1, future)         # stamp that is not the pending one
+    future.result.assert_not_called()
+    assert node._cancel_all is not None
+
+
+@pytest.mark.parametrize('code', [
+    bridge.CANCEL_ERROR_NONE, bridge.CANCEL_ERROR_REJECTED, 99])
+def test_ca_answer_arriving_when_nothing_is_pending_neither_raises_nor_creates_one(code):
+    node = make_nav_bridge(now=100.0)
+    node.cancel()
+    client = cancel_client(node)
+    client.answer(0, bridge.CANCEL_ERROR_NONE)      # clears the pending
+    assert node._cancel_all is None
+    node._on_cancel_all_response(node._now_ns(), NS(result=lambda: NS(return_code=code)))
+    late = FakeFuture()
+    late.value = NS(return_code=code)
+    node._on_cancel_all_response(node._now_ns(), late)
+    assert node._cancel_all is None
+    # a second (duplicate) answer to the same stamp is harmless too
+    client.answer(0, code)
+    assert node._cancel_all is None
+    assert len(client.requests) == 1
+
+
+def test_ca_answer_with_exception_when_nothing_is_pending_neither_raises_nor_warns():
+    node = make_nav_bridge(now=100.0)
+    node.cancel()
+    client = cancel_client(node)
+    client.answer(0, bridge.CANCEL_ERROR_NONE)
+    warnings_before = len(_warnings(node))
+    client.futures[0].resolve(error=RuntimeError('late'))
+    assert node._cancel_all is None
+    assert len(_warnings(node)) == warnings_before
+
+
+@pytest.mark.parametrize('code', [
+    bridge.CANCEL_ERROR_NONE, bridge.CANCEL_ERROR_UNKNOWN_GOAL_ID,
+    bridge.CANCEL_ERROR_GOAL_TERMINATED])
+def test_ca_current_stamp_final_codes_clear_the_pending_after_a_stale_answer(code):
+    node = make_nav_bridge(now=100.0)
+    client = cancel_client(node)
+    _, t2 = _arm_t2_after_t1_was_sent(node)
+    client.ready = True
+    tick(node, 1.0)                                 # t2 sent: futures[1]
+    assert_cancel_all_request(client.requests[1], t2)
+    client.answer(0, code)                          # stale: ignored
+    assert node._cancel_all is not None
+    client.answer(1, code)                          # current: clears
+    assert node._cancel_all is None
+    for _ in range(3):
+        tick(node, bridge.NAV_CANCEL_RETRY_S + 0.01)
+    assert len(client.requests) == 2
+
+
+@pytest.mark.parametrize('failure', ['rejected', 'exception'])
+def test_ca_current_stamp_failure_keeps_pending_and_retries_with_the_same_stamp(failure):
+    node = make_nav_bridge(now=100.0)
+    client = cancel_client(node)
+    _, t2 = _arm_t2_after_t1_was_sent(node)
+    client.ready = True
+    tick(node, 1.0)
+    if failure == 'rejected':
+        client.answer(1, bridge.CANCEL_ERROR_REJECTED)
+    else:
+        client.futures[1].resolve(error=RuntimeError('lost'))
+    assert node._cancel_all is not None and node._cancel_all['stamp_ns'] == t2
+    assert any('will retry' in m for m in _warnings(node))
+    tick(node, bridge.NAV_CANCEL_RETRY_S + 0.01)
+    assert len(client.requests) == 3
+    assert_cancel_all_request(client.requests[2], t2)
+
+
+def test_ca_each_attempt_registers_a_callback_bound_to_its_own_stamp():
+    node = make_nav_bridge(now=100.0)
+    client = cancel_client(node)
+    node.cancel()                                   # t1, attempt 1
+    t1 = node._cancel_all['stamp_ns']
+    tick(node, bridge.NAV_CANCEL_RETRY_S + 0.01)    # t1, attempt 2 (same stamp)
+    assert len(client.requests) == 2
+    assert [len(f.callbacks) for f in client.futures] == [1, 1]
+    # both answers belong to t1: the first (rejected) keeps it, the second clears it
+    client.answer(0, bridge.CANCEL_ERROR_REJECTED)
+    assert node._cancel_all is not None and node._cancel_all['stamp_ns'] == t1
+    client.answer(1, bridge.CANCEL_ERROR_NONE)
+    assert node._cancel_all is None
+
+
+def test_ca_answers_of_attempt_one_and_two_of_t1_do_not_touch_a_newer_t2():
+    node = make_nav_bridge(now=100.0)
+    client = cancel_client(node)
+    node.cancel()                                   # t1 attempt 1
+    tick(node, bridge.NAV_CANCEL_RETRY_S + 0.01)    # t1 attempt 2
+    node.clock[0] += 1.0
+    node.cancel()                                   # t2 rearmed (no goal): futures[2]
+    t2 = node._cancel_all['stamp_ns']
+    assert len(client.requests) == 3
+    client.answer(0, bridge.CANCEL_ERROR_NONE)
+    client.answer(1, bridge.CANCEL_ERROR_UNKNOWN_GOAL_ID)
+    assert node._cancel_all is not None and node._cancel_all['stamp_ns'] == t2
+    client.answer(2, bridge.CANCEL_ERROR_NONE)
+    assert node._cancel_all is None
+
+
+def test_ca_race_pending_rearmed_between_the_check_and_the_delete_is_not_deleted():
+    # Deterministic: future.result() runs between the first check (under the lock) and the
+    # delete (under the lock again); its side effect rearms the pending like cancel() would.
+    node = make_nav_bridge(now=100.0)
+    client = cancel_client(node)
+    node.cancel()                                   # t1
+    t1 = node._cancel_all['stamp_ns']
+
+    class RearmingFuture(FakeFuture):
+        def result(self):
+            node.clock[0] += 2.0
+            node.cancel()                           # rearms: pending is now t3 != t1
+            return NS(return_code=bridge.CANCEL_ERROR_NONE)
+
+    node._on_cancel_all_response(t1, RearmingFuture())
+    assert node._cancel_all is not None
+    t3 = node._cancel_all['stamp_ns']
+    assert t3 > t1
+    assert len(client.requests) == 2                # t3 was sent by the rearming cancel()
+    assert_cancel_all_request(client.requests[1], t3)
+    assert not [m for m in node.logger.info.call_args_list
+                if 'Cancel-all answered' in m[0][0]]
+    assert node.logger.debug.call_count == 1
+
+
+def test_ca_race_pending_cleared_between_the_check_and_the_delete_does_not_raise():
+    node = make_nav_bridge(now=100.0)
+    node.cancel()
+    t1 = node._cancel_all['stamp_ns']
+
+    class ClearingFuture(FakeFuture):
+        def result(self):
+            with node._nav_lock:
+                node._cancel_all = None             # e.g. send_goal or the watchdog
+            return NS(return_code=bridge.CANCEL_ERROR_NONE)
+
+    node._on_cancel_all_response(t1, ClearingFuture())
+    assert node._cancel_all is None
+
+
+def test_ca_the_pending_is_only_modified_while_holding_the_nav_lock():
+    node = make_nav_bridge(now=100.0)
+    node.cancel()
+    t1 = node._cancel_all['stamp_ns']
+    seen = []
+
+    class SpyLock:
+        def __init__(self, inner):
+            self.inner = inner
+            self.depth = 0
+
+        def __enter__(self):
+            self.inner.acquire()
+            self.depth += 1
+            return self
+
+        def __exit__(self, *args):
+            self.depth -= 1
+            self.inner.release()
+
+        def locked(self):
+            return self.inner.locked()
+
+    spy = SpyLock(node._nav_lock)
+    node._nav_lock = spy
+
+    class WatchedFuture(FakeFuture):
+        def result(self):
+            seen.append(spy.depth)                  # result() is read OUTSIDE the lock
+            return NS(return_code=bridge.CANCEL_ERROR_NONE)
+
+    node._on_cancel_all_response(t1, WatchedFuture())
+    assert seen == [0]
+    assert node._cancel_all is None
+
+
+@pytest.mark.parametrize('goals', [(), ('a',), ('a', 'b', 'c')])
+def test_ca_info_log_includes_the_number_of_goals_canceling(goals):
+    node = make_nav_bridge(now=100.0)
+    node.cancel()
+    cancel_client(node).futures[0].resolve(
+        NS(return_code=bridge.CANCEL_ERROR_NONE, goals_canceling=list(goals)))
+    assert node._cancel_all is None
+    messages = [c[0][0] for c in node.logger.info.call_args_list
+                if 'Cancel-all answered' in c[0][0]]
+    assert len(messages) == 1
+    assert f'goals_canceling={len(goals)}' in messages[0]
+    assert 'code 0' in messages[0]
+
+
+def test_ca_result_without_goals_canceling_still_clears_the_pending():
+    node = make_nav_bridge(now=100.0)
+    node.cancel()
+    cancel_client(node).futures[0].resolve(NS(return_code=bridge.CANCEL_ERROR_NONE))
+    assert node._cancel_all is None
+    messages = [c[0][0] for c in node.logger.info.call_args_list
+                if 'Cancel-all answered' in c[0][0]]
+    assert len(messages) == 1 and 'goals_canceling=0' in messages[0]
+
+
+def test_ca_goals_canceling_is_not_logged_for_a_rejected_answer():
+    node = make_nav_bridge(now=100.0)
+    node.cancel()
+    cancel_client(node).futures[0].resolve(
+        NS(return_code=bridge.CANCEL_ERROR_REJECTED, goals_canceling=['a']))
+    assert node._cancel_all is not None
+    assert not [c for c in node.logger.info.call_args_list
+                if 'Cancel-all answered' in c[0][0]]
+
+
+# === Web teleop on cmd_vel_nav, stop and watchdog (task 18, criteria I-3 and A-4) =============
+# SAFETY-CRITICAL: first time the web moves the robot. The node is built without Node.__init__;
+# the Twist class and the cmd_vel_nav publisher are doubles of the PUBLIC rclpy/geometry_msgs
+# API only (Twist() with linear/angular x,y,z; publisher.publish(msg)). A shared list of
+# events gives the exact order of publications vs. Nav2 calls. Time is the fake clock of
+# make_bridge (node.clock[0]); nothing sleeps. NOT covered here (needs the Pi): the real
+# publisher/QoS, the real executor running the 20 ms timer and velocity_smoother.
+
+from mtrb_bringup.web_utils import TeleopGate  # noqa: E402, I100
+
+ZERO_BURST = 3
+LEAK_TOKEN = 'LEAK-S3cr3t-token'
+
+
+class FakeTwist:
+    """Public shape of geometry_msgs/Twist: linear/angular with x, y, z = 0.0; no header."""
+
+    def __init__(self):
+        self.linear = NS(x=0.0, y=0.0, z=0.0)
+        self.angular = NS(x=0.0, y=0.0, z=0.0)
+
+
+class FakeCmdVelPublisher:
+    """Public rclpy Publisher API: publish(msg). Every ATTEMPT is logged in node.events."""
+
+    def __init__(self, node):
+        self.node = node
+        self.msgs = []              # messages whose publish() succeeded
+        self.attempts = 0
+        self.fail_on = set()        # attempt numbers (0-based) that raise
+        self.always_fail = False
+        self.hook = None            # callable(vx, wz) run inside publish()
+
+    def publish(self, msg):
+        number = self.attempts
+        self.attempts += 1
+        self.node.events.append(('pub', msg.linear.x, msg.angular.z, self.node.clock[0]))
+        if self.hook is not None:
+            self.hook(msg.linear.x, msg.angular.z)
+        if self.always_fail or number in self.fail_on:
+            raise RuntimeError('publish failed')
+        self.msgs.append(msg)
+
+
+class EventHandle(FakeHandle):
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+
+    def cancel_goal_async(self):
+        self.events.append(('cancel',))
+        return super().cancel_goal_async()
+
+
+class EventActionClient(FakeActionClient):
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+
+    def send_goal_async(self, goal, feedback_callback=None):
+        self.events.append(('send_goal',))
+        return super().send_goal_async(goal, feedback_callback)
+
+
+def make_teleop_bridge(monkeypatch, now=100.0, enabled=True, gate=True):
+    monkeypatch.setattr(bridge, 'Twist', FakeTwist)
+    node = make_nav_bridge(now)
+    node.events = []
+    node._nav_client = EventActionClient(node.events)
+    node._cancel_all_client.lock_probe = lambda: node.events.append(('cancel_all',))
+    node._cmd_vel_nav_pub = FakeCmdVelPublisher(node)
+    node._initial_pose_pub = mock.Mock()
+    if gate:
+        node._teleop_gate = TeleopGate(0.2, 0.8, 0.3, node._now_s, enabled=enabled)
+    return node
+
+
+def tmsg(seq, vx=0.1, wz=0.2):
+    return {'type': 'teleop', 'vx': vx, 'wz': wz, 'seq': seq}
+
+
+def published(node):
+    """[(vx, wz)] of every publication attempt, in order."""
+    return [(e[1], e[2]) for e in node.events if e[0] == 'pub']
+
+
+def zero_count(node):
+    return sum(1 for p in published(node) if p == (0.0, 0.0))
+
+
+def accept_goal(node):
+    """Send a goal and let Nav2 accept it with a handle that logs its cancel."""
+    node.send_goal(1.0, 2.0, 0.5)
+    handle = EventHandle(node.events)
+    node._nav_client.futures[-1].resolve(handle)
+    return handle
+
+
+def lock_test_events(node):
+    return [e for e in node.events if e[0] in ('send_goal', 'cancel', 'cancel_all')]
+
+
+# --- published message ---------------------------------------------------------------------
+
+def test_teleop_publishes_one_twist_with_only_linear_x_and_angular_z(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    assert node.teleop(1, tmsg(0, vx=0.1, wz=-0.3)) is None
+    [msg] = node._cmd_vel_nav_pub.msgs
+    assert isinstance(msg, bridge.Twist)
+    assert (msg.linear.x, msg.angular.z) == (0.1, -0.3)
+    assert (msg.linear.y, msg.linear.z, msg.angular.x, msg.angular.y) == (0.0, 0.0, 0.0, 0.0)
+    assert not hasattr(msg, 'header')  # Twist, not TwistStamped: there is no stamp to fill
+
+
+@pytest.mark.parametrize('vx, wz, expected', [
+    (9.0, 9.0, (0.2, 0.8)), (-9.0, -9.0, (-0.2, -0.8)), (0.2, 0.8, (0.2, 0.8))])
+def test_teleop_publishes_the_saturated_velocity(monkeypatch, vx, wz, expected):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0, vx=vx, wz=wz))
+    assert published(node) == [expected]
+
+
+def test_published_velocities_are_floats(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0, vx=0, wz=1))
+    [msg] = node._cmd_vel_nav_pub.msgs
+    assert type(msg.linear.x) is float and type(msg.angular.z) is float
+    assert (msg.linear.x, msg.angular.z) == (0.0, 0.8)
+
+
+def test_zero_twist_has_every_field_at_zero(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.stop()
+    assert len(node._cmd_vel_nav_pub.msgs) == ZERO_BURST
+    for msg in node._cmd_vel_nav_pub.msgs:
+        assert isinstance(msg, bridge.Twist)
+        assert [msg.linear.x, msg.linear.y, msg.linear.z,
+                msg.angular.x, msg.angular.y, msg.angular.z] == [0.0] * 6
+
+
+def test_nothing_is_published_for_rejected_dropped_or_invalid_messages(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.events.clear()
+    assert node.teleop(1, tmsg(0)) is None                        # replayed seq: dropped
+    node.clock[0] += 0.01
+    assert node.teleop(2, tmsg(0))[0] == 'teleop_rejected'        # lease held by client 1
+    assert node.teleop(1, tmsg(1, vx=float('nan')))[0] == 'invalid_teleop'
+    node.clock[0] += 1.0                                          # past the reply throttle
+    assert node.teleop(1, None)[0] == 'invalid_teleop'
+    assert published(node) == []
+
+
+def test_teleop_never_touches_the_initial_pose_publisher(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.stop()
+    node.teleop_disconnect(1)
+    node.clock[0] += 1.0
+    node._teleop_watchdog()
+    node._initial_pose_pub.publish.assert_not_called()
+
+
+# --- I-3: watchdog (fake clock, no sleep) --------------------------------------------------
+
+def test_i3_silence_for_300_ms_publishes_a_zero_twist_and_then_stops_publishing(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    start = node.clock[0]
+    assert node.teleop(1, tmsg(0)) is None
+    for k in range(1, 151):                      # 3 s of 20 ms watchdog ticks
+        node.clock[0] = start + k * 0.02
+        node._teleop_watchdog()
+    zero_times = [round(e[3] - start, 6) for e in node.events
+                  if e[0] == 'pub' and (e[1], e[2]) == (0.0, 0.0)]
+    assert published(node) == [(0.1, 0.2)] + [(0.0, 0.0)] * ZERO_BURST
+    assert len(zero_times) == ZERO_BURST
+    assert min(zero_times) > 0.3 - 1e-6          # never before 300 ms of silence
+    assert max(zero_times) <= 0.32 + 1e-6        # at the first 20 ms tick after 300 ms
+
+
+def test_i3_watchdog_does_not_publish_at_exactly_300_ms_and_does_just_after(monkeypatch):
+    node = make_teleop_bridge(monkeypatch, now=100.0)
+    node.teleop(1, tmsg(0))
+    node.clock[0] = 100.3
+    node._teleop_watchdog()
+    assert published(node) == [(0.1, 0.2)]
+    node.clock[0] = 100.3001
+    node._teleop_watchdog()
+    assert published(node) == [(0.1, 0.2)] + [(0.0, 0.0)] * ZERO_BURST
+    node.clock[0] = 100.32
+    node._teleop_watchdog()
+    node.clock[0] = 105.0
+    node._teleop_watchdog()
+    assert zero_count(node) == ZERO_BURST
+
+
+def test_i3_watchdog_reads_only_the_injected_clock(monkeypatch):
+    class NoWallClock:
+        def __getattr__(self, name):
+            raise AssertionError(f'time.{name} used by the teleop path')
+
+    node = make_teleop_bridge(monkeypatch)
+    monkeypatch.setattr(bridge, 'time', NoWallClock())
+    node.teleop(1, tmsg(0))
+    node.clock[0] += 0.4
+    node._teleop_watchdog()
+    assert zero_count(node) == ZERO_BURST
+
+
+def test_i3_steady_stream_of_commands_keeps_the_robot_driving_without_zeros(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    for seq in range(40):                         # 10 Hz for 4 s, watchdog ticks in between
+        node.clock[0] = 100.0 + seq * 0.1
+        assert node.teleop(1, tmsg(seq)) is None
+        for tick in range(5):
+            node.clock[0] += 0.02
+            node._teleop_watchdog()
+    assert zero_count(node) == 0
+    assert len(published(node)) == 40
+
+
+def test_i3_after_silence_the_stream_can_restart(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.clock[0] += 0.4
+    node._teleop_watchdog()
+    node.clock[0] += 0.1
+    assert node.teleop(1, tmsg(1)) is None
+    assert published(node)[-1] == (0.1, 0.2)
+    node.clock[0] += 0.4
+    node._teleop_watchdog()
+    assert zero_count(node) == 2 * ZERO_BURST
+
+
+def test_watchdog_with_nobody_controlling_never_publishes(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    for k in range(500):
+        node.clock[0] += 0.02
+        node._teleop_watchdog()
+    assert node.events == []
+
+
+def test_watchdog_without_a_gate_is_a_noop(monkeypatch):
+    node = make_teleop_bridge(monkeypatch, gate=False)
+    node._teleop_watchdog()
+    assert node.events == []
+
+
+def test_watchdog_failure_publishes_zeros_and_logs_an_error(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node._teleop_gate.watchdog_tick = mock.Mock(side_effect=RuntimeError('gate broke'))
+    node._teleop_watchdog()
+    assert published(node) == [(0.0, 0.0)] * ZERO_BURST
+    assert any('watchdog' in m.lower() for m in _errors(node))
+
+
+def test_watchdog_does_not_publish_zeros_again_after_the_burst_even_if_late(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.clock[0] += 10.0                        # the executor was stalled for 10 s
+    node._teleop_watchdog()
+    node._teleop_watchdog()
+    assert zero_count(node) == ZERO_BURST
+
+
+# --- A-4: stop ----------------------------------------------------------------------------
+
+def test_stop_publishes_the_zero_burst_before_anything_else(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.stop()
+    assert published(node) == [(0.0, 0.0)] * ZERO_BURST
+    assert [e[0] for e in node.events][:ZERO_BURST] == ['pub'] * ZERO_BURST
+
+
+def test_a4_stop_publishes_the_first_zero_in_less_than_500_ms_of_the_fake_clock(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    requested = node.clock[0]
+    node.stop()
+    first_zero = [e for e in node.events if e[0] == 'pub' and (e[1], e[2]) == (0.0, 0.0)][0]
+    assert first_zero[3] - requested < 0.5
+    assert first_zero[3] - requested == 0.0      # synchronous chain: no waiting at all
+
+
+def test_stop_with_a_goal_publishes_zeros_first_and_then_cancels_the_goal(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    accept_goal(node)
+    node.events.clear()
+    node.stop()
+    kinds = [e[0] for e in node.events]
+    assert kinds[:ZERO_BURST] == ['pub'] * ZERO_BURST
+    assert kinds[ZERO_BURST:] == ['cancel']
+
+
+def test_stop_with_nav2_down_still_publishes_zeros_and_arms_the_cancel_all(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node._nav_client.ready = False
+    cancel_client(node).ready = False
+    node.stop()
+    assert published(node) == [(0.0, 0.0)] * ZERO_BURST
+    assert lock_test_events(node) == []
+    assert node._cancel_all is not None           # the cancel stays pending for the retries
+
+
+def test_stop_without_a_goal_sends_the_cancel_all_after_the_zeros(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.stop()
+    kinds = [e[0] for e in node.events]
+    assert kinds == ['pub'] * ZERO_BURST + ['cancel_all']
+
+
+def test_stop_zeros_precede_a_cancel_that_raises(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+
+    def failing_cancel():
+        node.events.append(('cancel',))
+        raise RuntimeError('cancel exploded')
+
+    node.cancel = failing_cancel
+    node.stop()                                   # must not raise
+    kinds = [e[0] for e in node.events]
+    assert kinds == ['pub'] * ZERO_BURST + ['cancel']
+    assert any('Cancel during stop failed' in m for m in _errors(node))
+
+
+def test_stop_does_not_depend_on_the_nav_lock(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node._nav_lock.acquire()                      # a stuck Nav2 callback holds the nav lock
+    try:
+        done = threading.Thread(target=node._stop_teleop_only)
+        done.start()
+        done.join(2.0)
+        assert not done.is_alive()
+    finally:
+        node._nav_lock.release()
+    assert zero_count(node) == ZERO_BURST
+
+
+def test_stop_releases_the_lease_so_that_another_client_can_drive(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.stop()
+    node._nav_client.ready = False                # nothing may keep the node "busy"
+    cancel_client(node).ready = False
+    node.clock[0] += 0.1
+    assert node.teleop(2, tmsg(0)) is None
+    assert published(node)[-1] == (0.1, 0.2)
+
+
+def test_stop_then_watchdog_does_not_publish_a_second_burst(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.stop()
+    node.clock[0] += 1.0
+    node._teleop_watchdog()
+    assert zero_count(node) == ZERO_BURST
+
+
+def test_stop_without_a_gate_still_publishes_the_zero_burst(monkeypatch):
+    node = make_teleop_bridge(monkeypatch, gate=False)
+    node.stop()
+    assert published(node) == [(0.0, 0.0)] * ZERO_BURST
+
+
+def test_stop_with_the_teleop_disabled_still_publishes_zeros(monkeypatch):
+    node = make_teleop_bridge(monkeypatch, enabled=False)
+    node.stop()
+    assert zero_count(node) == ZERO_BURST
+
+
+def test_stop_is_logged_without_any_velocity_data(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.stop()
+    assert any('Stop requested' in m for m in _warnings(node))
+
+
+@pytest.mark.parametrize('fail_on', [{0}, {1}, {2}, {0, 1}, {0, 2}, {1, 2}])
+def test_stop_keeps_publishing_the_remaining_zeros_when_a_publish_raises(monkeypatch, fail_on):
+    node = make_teleop_bridge(monkeypatch)
+    node._cmd_vel_nav_pub.fail_on = fail_on
+    node.stop()                                   # never raises
+    assert node._cmd_vel_nav_pub.attempts >= ZERO_BURST
+    assert len(node._cmd_vel_nav_pub.msgs) == ZERO_BURST - len(fail_on)
+    assert len(_errors(node)) >= len(fail_on)
+
+
+def test_stop_attempts_the_full_burst_even_if_every_publish_raises(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node._cmd_vel_nav_pub.always_fail = True
+    node.stop()
+    assert node._cmd_vel_nav_pub.attempts == ZERO_BURST
+    assert len(node.events) == ZERO_BURST + 1     # + the cancel-all of stop()
+    assert node.events[-1] == ('cancel_all',)
+
+
+def test_a_publish_error_during_teleop_does_not_propagate_and_is_logged(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node._cmd_vel_nav_pub.always_fail = True
+    assert node.teleop(1, tmsg(0)) is None
+    assert any('cmd_vel_nav' in m for m in _errors(node))
+
+
+def test_a_publish_error_does_not_leave_the_watchdog_disarmed(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node._cmd_vel_nav_pub.fail_on = {0}
+    node.teleop(1, tmsg(0))                       # the command failed to publish
+    node.clock[0] += 0.4
+    node._teleop_watchdog()                       # the zeros still go out
+    assert len(node._cmd_vel_nav_pub.msgs) == ZERO_BURST
+
+
+# --- teleop vs goals -----------------------------------------------------------------------
+
+def test_send_goal_with_active_teleop_publishes_zeros_before_send_goal_async(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.events.clear()
+    node.send_goal(1.0, 2.0, 0.5)
+    kinds = [e[0] for e in node.events]
+    assert kinds == ['pub'] * ZERO_BURST + ['send_goal']
+    assert published(node) == [(0.0, 0.0)] * ZERO_BURST
+
+
+def test_send_goal_releases_the_teleop_lease_and_the_watchdog_stays_quiet(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.send_goal(1.0, 2.0, 0.5)
+    node.clock[0] += 1.0
+    node._teleop_watchdog()
+    assert zero_count(node) == ZERO_BURST
+    assert node._teleop_gate.active is False
+
+
+def test_teleop_after_a_goal_started_is_rejected_and_publishes_nothing(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.send_goal(1.0, 2.0, 0.5)
+    node.events.clear()
+    node.clock[0] += 0.1
+    reply = node.teleop(1, tmsg(1))
+    assert reply is not None and reply[0] == 'teleop_rejected'
+    assert published(node) == []
+
+
+def test_send_goal_without_teleop_publishes_no_zeros(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.send_goal(1.0, 2.0, 0.5)
+    assert published(node) == []
+    assert node.events == [('send_goal',)]
+
+
+def test_send_goal_after_the_teleop_already_ended_publishes_no_extra_zeros(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.clock[0] += 0.4
+    node._teleop_watchdog()
+    node.events.clear()
+    node.send_goal(1.0, 2.0, 0.5)
+    assert published(node) == []
+
+
+def test_send_goal_refused_without_nav2_does_not_disturb_the_teleop(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.events.clear()
+    node._nav_client.ready = False
+    with pytest.raises(bridge.NavUnavailableError):
+        node.send_goal(1.0, 2.0, 0.5)
+    assert published(node) == []
+    node.clock[0] += 0.1
+    assert node.teleop(1, tmsg(1)) is None
+    assert published(node) == [(0.1, 0.2)]
+
+
+def test_send_goal_zeros_failure_does_not_prevent_the_goal(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node._cmd_vel_nav_pub.always_fail = True
+    goal_id = node.send_goal(1.0, 2.0, 0.5)
+    assert goal_id and ('send_goal',) in node.events
+    assert node._cmd_vel_nav_pub.attempts == 1 + ZERO_BURST
+
+
+def test_teleop_is_rejected_with_an_active_goal(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.send_goal(1.0, 2.0, 0.5)
+    node.events.clear()
+    reply = node.teleop(1, tmsg(0))
+    assert reply is not None and reply[0] == 'teleop_rejected'
+    assert published(node) == []
+
+
+def test_teleop_is_rejected_with_an_accepted_goal(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    accept_goal(node)
+    node.events.clear()
+    assert node.teleop(1, tmsg(0))[0] == 'teleop_rejected'
+    assert published(node) == []
+
+
+def test_teleop_is_rejected_while_an_orphan_goal_is_unconfirmed(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    make_orphan(node)
+    node.events.clear()
+    assert node.teleop(1, tmsg(0))[0] == 'teleop_rejected'
+    assert published(node) == []
+
+
+def test_teleop_is_rejected_with_a_pending_cancel_all_if_the_action_server_is_ready(
+        monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    cancel_client(node).ready = False             # the cancel-all stays pending
+    node.cancel()
+    assert node._cancel_all is not None
+    node._nav_client.ready = True
+    assert node.teleop(1, tmsg(0))[0] == 'teleop_rejected'
+    assert published(node) == []
+
+
+def test_teleop_is_not_rejected_with_a_pending_cancel_all_if_the_server_is_not_ready(
+        monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    cancel_client(node).ready = False
+    node.cancel()
+    assert node._cancel_all is not None
+    node._nav_client.ready = False                # Nav2 absent (e.g. mode mapping)
+    assert node.teleop(1, tmsg(0)) is None
+    assert published(node) == [(0.1, 0.2)]
+
+
+def test_stop_does_not_block_the_teleop_for_good_when_nav2_is_absent(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node._nav_client.ready = False
+    cancel_client(node).ready = False
+    node.stop()
+    node.clock[0] += 0.1
+    assert node.teleop(1, tmsg(0)) is None
+
+
+def test_stop_with_nav2_up_blocks_the_teleop_until_the_cancel_all_is_answered(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.stop()                                   # cancel-all sent, not answered yet
+    node.clock[0] += 0.1
+    assert node.teleop(1, tmsg(0))[0] == 'teleop_rejected'
+    cancel_client(node).answer(0, bridge.CANCEL_ERROR_NONE)
+    node.clock[0] += 1.5                          # past the error-reply throttle
+    assert node.teleop(1, tmsg(1)) is None
+
+
+def test_nav_busy_is_false_when_idle_and_true_for_each_busy_cause(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    assert node._nav_busy() is False
+    node.send_goal(1.0, 2.0, 0.5)
+    assert node._nav_busy() is True
+
+
+def test_cancel_all_becoming_pending_while_driving_stops_the_teleop(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    cancel_client(node).ready = False
+    node.teleop(1, tmsg(0))
+    node.cancel()                                 # idle cancel: arms a pending cancel-all
+    node.events.clear()
+    node.clock[0] += 0.1
+    reply = node.teleop(1, tmsg(1))
+    assert reply[0] == 'teleop_rejected'
+    assert published(node) == [(0.0, 0.0)] * ZERO_BURST
+
+
+def test_busy_check_happens_inside_the_teleop_lock(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    seen = []
+    original = node._nav_busy
+
+    def spy():
+        seen.append(node._teleop_lock.locked())
+        return original()
+
+    node._nav_busy = spy
+    node.teleop(1, tmsg(0))
+    assert seen == [True]
+
+
+def test_disabled_teleop_answers_teleop_disabled_and_publishes_nothing(monkeypatch):
+    node = make_teleop_bridge(monkeypatch, enabled=False)
+    reply = node.teleop(1, tmsg(0))
+    assert reply[0] == 'teleop_disabled'
+    assert published(node) == []
+
+
+# --- disconnect ----------------------------------------------------------------------------
+
+def test_disconnect_of_the_owner_publishes_zeros_at_once(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.events.clear()
+    node.teleop_disconnect(1)
+    assert published(node) == [(0.0, 0.0)] * ZERO_BURST
+
+
+def test_disconnect_of_another_client_publishes_nothing_and_keeps_the_owner(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.events.clear()
+    node.teleop_disconnect(2)
+    assert published(node) == []
+    assert node._teleop_gate.active is True
+
+
+def test_disconnect_of_a_client_that_never_drove_publishes_nothing(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop_disconnect(7)
+    assert node.events == []
+
+
+def test_disconnect_then_watchdog_does_not_repeat_the_burst(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.teleop_disconnect(1)
+    node.clock[0] += 1.0
+    node._teleop_watchdog()
+    assert zero_count(node) == ZERO_BURST
+
+
+def test_disconnect_without_a_gate_is_a_noop(monkeypatch):
+    node = make_teleop_bridge(monkeypatch, gate=False)
+    node.teleop_disconnect(1)
+    assert node.events == []
+
+
+def test_disconnect_failure_in_the_gate_stops_the_robot_and_logs(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node._teleop_gate.client_disconnected = mock.Mock(side_effect=RuntimeError('boom'))
+    node.teleop_disconnect(1)
+    assert published(node) == [(0.0, 0.0)] * ZERO_BURST
+    assert any('disconnect' in m.lower() for m in _errors(node))
+
+
+# --- fail closed ---------------------------------------------------------------------------
+
+def test_teleop_without_a_gate_is_rejected_and_publishes_nothing(monkeypatch):
+    node = make_teleop_bridge(monkeypatch, gate=False)
+    assert node._teleop_gate is None
+    reply = node.teleop(1, tmsg(0))
+    assert reply is not None and reply[0] == 'teleop_rejected'
+    assert node.events == []
+
+
+def test_gate_exception_stops_the_robot_logs_and_replies_with_an_error(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node._teleop_gate.on_teleop = mock.Mock(side_effect=RuntimeError('gate broke'))
+    reply = node.teleop(1, tmsg(0))
+    assert reply is not None and reply[0] == 'teleop_rejected'
+    assert published(node) == [(0.0, 0.0)] * ZERO_BURST
+    assert any('Teleop failed' in m for m in _errors(node))
+
+
+def test_gate_exception_releases_the_lease(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node._teleop_gate.on_teleop = mock.Mock(side_effect=RuntimeError('gate broke'))
+    node.teleop(1, tmsg(1))
+    assert node._teleop_gate.owner_age_s is None
+
+
+def test_nav_busy_exception_is_handled_as_a_failure_with_zeros(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node._nav_busy = mock.Mock(side_effect=RuntimeError('lock broke'))
+    reply = node.teleop(1, tmsg(0))
+    assert reply[0] == 'teleop_rejected'
+    assert published(node) == [(0.0, 0.0)] * ZERO_BURST
+
+
+def test_the_teleop_lock_is_released_after_a_failure(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node._teleop_gate.on_teleop = mock.Mock(side_effect=RuntimeError('gate broke'))
+    node.teleop(1, tmsg(0))
+    assert node._teleop_lock.locked() is False
+    node.stop()
+    assert node._teleop_lock.locked() is False
+
+
+# --- lock order and race with stop ---------------------------------------------------------
+
+class SpyLock:
+    """Context-manager lock that records acquisitions and which locks were already held."""
+
+    def __init__(self, name, held, log):
+        self.name, self.held, self.log = name, held, log
+        self._real = threading.Lock()
+
+    def __enter__(self):
+        self.log.append((self.name, tuple(self.held)))
+        self._real.acquire()
+        self.held.append(self.name)
+        return self
+
+    def __exit__(self, *exc):
+        self.held.remove(self.name)
+        self._real.release()
+        return False
+
+    def locked(self):
+        return self._real.locked()
+
+
+def test_lock_order_is_teleop_lock_then_nav_lock_never_the_reverse(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    held, log = [], []
+    node._teleop_lock = SpyLock('teleop', held, log)
+    node._nav_lock = SpyLock('nav', held, log)
+    node.teleop(1, tmsg(0))                       # busy check under the teleop lock
+    node.teleop(2, tmsg(0))                       # rejected by lease
+    node.send_goal(1.0, 2.0, 0.5)                 # nav lock, then the teleop stop
+    node.teleop(1, tmsg(1))                       # rejected: goal active
+    node.stop()
+    node.cancel()
+    node.clock[0] += 1.0
+    node._teleop_watchdog()
+    node._nav_watchdog()
+    node.teleop_disconnect(1)
+    node._teleop_stop_if_owned()
+    taken_teleop_under_nav = [e for e in log if e[0] == 'teleop' and 'nav' in e[1]]
+    assert taken_teleop_under_nav == []
+    # the spy really sees the allowed nesting (busy check inside the teleop lock)
+    assert any(e[0] == 'nav' and 'teleop' in e[1] for e in log)
+    assert held == []
+
+
+def test_a_command_accepted_just_before_a_stop_is_never_published_after_the_zeros(
+        monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    inside, release = threading.Event(), threading.Event()
+
+    def hook(vx, wz):
+        if (vx, wz) != (0.0, 0.0) and not inside.is_set():
+            inside.set()
+            release.wait(5.0)                     # the command is "in flight" in publish()
+
+    node._cmd_vel_nav_pub.hook = hook
+    sender = threading.Thread(target=node.teleop, args=(1, tmsg(0)))
+    stopper = threading.Thread(target=node.stop)
+    sender.start()
+    assert inside.wait(5.0)
+    stopper.start()
+    stopper.join(0.05)
+    blocked = stopper.is_alive()                  # the stop must wait for the in-flight command
+    release.set()
+    sender.join(5.0)
+    stopper.join(5.0)
+    assert blocked, 'stop() overtook a command that was already accepted'
+    assert published(node) == [(0.1, 0.2)] + [(0.0, 0.0)] * ZERO_BURST
+
+
+def test_two_clients_cannot_publish_concurrently(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    inside, release = threading.Event(), threading.Event()
+    active = []
+    overlap = []
+
+    def hook(vx, wz):
+        active.append(1)
+        overlap.append(len(active))
+        if not inside.is_set():
+            inside.set()
+            release.wait(5.0)
+        active.pop()
+
+    node._cmd_vel_nav_pub.hook = hook
+    first = threading.Thread(target=node.teleop, args=(1, tmsg(0)))
+    second = threading.Thread(target=node.teleop, args=(2, tmsg(0)))
+    first.start()
+    assert inside.wait(5.0)
+    second.start()
+    second.join(0.05)
+    release.set()
+    first.join(5.0)
+    second.join(5.0)
+    assert max(overlap) == 1                      # publishes are serialized by one lock
+    assert published(node) == [(0.1, 0.2)]        # client 2 lost the lease
+
+
+# --- chain through the real FastAPI app (doubles for ROS) ----------------------------------
+
+def _app_client(node):
+    pytest.importorskip('httpx')
+    from fastapi.testclient import TestClient
+    from mtrb_bringup.web_server import create_app
+    return TestClient(create_app(StateStore(), 'tok-123', nav_port=node))
+
+
+def test_post_api_stop_publishes_the_zeros_within_500_ms_of_the_fake_clock(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.teleop(1, tmsg(0))
+    requested = node.clock[0]
+    response = _app_client(node).post('/api/stop', headers={'Authorization': 'Bearer tok-123'})
+    assert response.status_code == 200 and response.json() == {'ok': True}
+    assert published(node) == [(0.1, 0.2)] + [(0.0, 0.0)] * ZERO_BURST
+    assert node.events[1][3] - requested < 0.5
+
+
+def test_post_api_stop_without_token_publishes_nothing(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    assert _app_client(node).post('/api/stop').status_code == 401
+    assert node.events == []
+
+
+def test_ws_teleop_and_stop_reach_the_node_and_the_disconnect_stops_the_robot(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    disconnected = threading.Event()
+    original = node.teleop_disconnect
+
+    def disconnect_and_signal(client_id):
+        original(client_id)
+        disconnected.set()
+
+    node.teleop_disconnect = disconnect_and_signal
+    client = _app_client(node)
+    with client, client.websocket_connect('/ws?token=tok-123') as ws:
+        ws.send_text(json.dumps(tmsg(0, vx=0.15, wz=0.4)))
+        ws.send_text('{"type":"probe"}')
+        assert json.loads(ws.receive_text())['code'] == 'unsupported_message'
+        assert published(node) == [(0.15, 0.4)]
+    assert disconnected.wait(3.0), 'the closed WebSocket did not stop the teleop'
+    assert published(node) == [(0.15, 0.4)] + [(0.0, 0.0)] * ZERO_BURST
+
+
+def test_ws_stop_message_publishes_the_zero_burst(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    client = _app_client(node)
+    with client, client.websocket_connect('/ws?token=tok-123') as ws:
+        ws.send_text(json.dumps(tmsg(0)))
+        ws.send_text('{"type":"stop"}')
+        ws.send_text('{"type":"probe"}')
+        ws.receive_text()
+        assert published(node) == [(0.1, 0.2)] + [(0.0, 0.0)] * ZERO_BURST
+
+
+def test_ws_second_client_cannot_drive_while_the_first_one_does(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    replies, handled = [], [threading.Event(), threading.Event()]
+    original = node.teleop
+
+    def teleop_and_record(client_id, message):
+        reply = original(client_id, message)
+        replies.append((client_id, reply))
+        handled[len(replies) - 1].set()
+        return reply
+
+    node.teleop = teleop_and_record
+    client = _app_client(node)
+    with client, client.websocket_connect('/ws?token=tok-123') as first, \
+            client.websocket_connect('/ws?token=tok-123') as second:
+        first.send_text(json.dumps(tmsg(0)))
+        assert handled[0].wait(3.0)
+        second.send_text(json.dumps(tmsg(0, vx=0.2)))
+        assert handled[1].wait(3.0)
+        assert replies[0][1] is None
+        assert replies[1][1] is not None and replies[1][1][0] == 'teleop_rejected'
+        reply = json.loads(second.receive_text())  # only reached when an error was produced
+        assert reply['code'] == 'teleop_rejected'
+        assert published(node) == [(0.1, 0.2)]
+
+
+# --- _read_teleop_settings -----------------------------------------------------------------
+
+def _teleop_settings_node(clock=None, **overrides):
+    values = dict(TELEOP_DEFAULTS)
+    values.update({f'teleop.{k}': v for k, v in overrides.items()})
+    node = object.__new__(bridge.MtrbWebBridge)
+    node.get_parameter = lambda name: FakeParam(values[name])
+    node.clock = clock if clock is not None else [0.0]   # the ROS clock of the node
+    node._now_s = lambda: node.clock[0]
+    return node
+
+
+def _patch_monotonic(monkeypatch, start=0.0):
+    """Replace the `time` module seen by the bridge: time.monotonic() reads mono[0].
+
+    Only the bridge module is patched (not the global time module), so pytest and the
+    test client keep their real clocks. Returns the mutable fake monotonic clock.
+    """
+    mono = [start]
+    monkeypatch.setattr(bridge, 'time', NS(monotonic=lambda: mono[0]))
+    return mono
+
+
+def test_teleop_parameter_defaults_are_0_2_0_8_and_300_ms():
+    defaults = dict(bridge.PARAMETERS)
+    assert defaults['teleop.max_vx'] == 0.2
+    assert defaults['teleop.max_wz'] == 0.8
+    assert defaults['teleop.timeout_ms'] == 300
+    assert defaults['teleop.enabled'] is True
+
+
+def test_hard_ceilings_are_the_create3_limits():
+    assert bridge.TELEOP_HARD_MAX_VX_MPS == 0.46
+    assert bridge.TELEOP_HARD_MAX_WZ_RADPS == 1.9
+    assert (bridge.TELEOP_MIN_TIMEOUT_MS, bridge.TELEOP_MAX_TIMEOUT_MS) == (50, 1000)
+
+
+def test_default_settings_build_a_gate_with_the_default_limits_and_timeout(monkeypatch):
+    mono = _patch_monotonic(monkeypatch)
+    node = _teleop_settings_node()
+    node._read_teleop_settings()
+    gate = node._teleop_gate
+    assert gate.on_teleop('a', tmsg(0, vx=9, wz=-9), False).twist == (0.2, -0.8)
+    mono[0] += 0.3
+    assert gate.watchdog_tick().kind == 'idle'
+    mono[0] += 0.0001
+    assert gate.watchdog_tick().kind == 'zero'
+
+
+def test_the_gate_uses_time_monotonic_by_default_and_not_the_ros_clock(monkeypatch):
+    mono = _patch_monotonic(monkeypatch)
+    node = _teleop_settings_node()
+    node._read_teleop_settings()
+    node._teleop_gate.on_teleop('a', tmsg(0), False)
+    assert node._teleop_gate.owner_age_s == 0.0
+    node.clock[0] += 5000.0          # the ROS clock moves: the gate must not notice
+    assert node._teleop_gate.owner_age_s == 0.0
+    mono[0] += 0.125                 # the monotonic clock moves: the gate follows it
+    assert node._teleop_gate.owner_age_s == pytest.approx(0.125)
+
+
+def test_the_gate_clock_is_the_real_time_monotonic_when_not_patched():
+    import time
+    node = _teleop_settings_node()
+    node._read_teleop_settings()
+    assert node._teleop_gate._clock is time.monotonic
+
+
+def test_a_ros_clock_jump_backwards_does_not_freeze_the_gate_timeout(monkeypatch):
+    node = make_teleop_bridge(monkeypatch, gate=False)
+    node.get_parameter = lambda name: FakeParam(TELEOP_DEFAULTS[name])
+    mono = _patch_monotonic(monkeypatch)
+    node._read_teleop_settings()
+    assert node.teleop(1, tmsg(0)) is None
+    node.clock[0] -= 1.0e6           # NTP step backwards of the ROS/system clock
+    mono[0] += 0.3001                # but the command is older than the 300 ms timeout
+    node._teleop_watchdog()
+    assert published(node) == [(0.1, 0.2)] + [(0.0, 0.0)] * ZERO_BURST
+
+
+def test_a_ros_clock_jump_forwards_does_not_expire_a_fresh_command(monkeypatch):
+    node = make_teleop_bridge(monkeypatch, gate=False)
+    node.get_parameter = lambda name: FakeParam(TELEOP_DEFAULTS[name])
+    mono = _patch_monotonic(monkeypatch)
+    node._read_teleop_settings()
+    assert node.teleop(1, tmsg(0)) is None
+    node.clock[0] += 1.0e6           # forward jump of the ROS clock
+    mono[0] += 0.1                   # real time: the command is still fresh
+    node._teleop_watchdog()
+    assert published(node) == [(0.1, 0.2)]
+
+
+def test_the_teleop_watchdog_timer_uses_a_steady_clock():
+    node = _io_node()
+    calls = [c for c in node.create_timer.call_args_list
+             if c.args[1].__name__ == '_teleop_watchdog']
+    assert len(calls) == 1
+    clock = calls[0].kwargs.get('clock')
+    assert isinstance(clock, bridge.Clock)
+    assert clock.clock_type == bridge.ClockType.STEADY_TIME
+
+
+@pytest.mark.parametrize('max_vx, max_wz', [(0.46, 1.9), (0.05, 0.1), (1e-6, 1e-6), (0.1, 1)])
+def test_valid_limits_up_to_the_hard_ceilings_are_accepted(max_vx, max_wz):
+    node = _teleop_settings_node(max_vx=max_vx, max_wz=max_wz)
+    node._read_teleop_settings()
+    twist = node._teleop_gate.on_teleop('a', tmsg(0, vx=99, wz=99), False).twist
+    assert twist == (float(max_vx), float(max_wz))
+
+
+@pytest.mark.parametrize('bad', [0, 0.0, -0.1, 0.4601, 0.47, 1, 5.0, float('nan'),
+                                 float('inf'), -float('inf'), True, False, '0.2', None, [0.2]])
+def test_invalid_max_vx_raises_config_error_naming_the_parameter(bad):
+    with pytest.raises(bridge.ConfigError, match='teleop.max_vx'):
+        _teleop_settings_node(max_vx=bad)._read_teleop_settings()
+
+
+@pytest.mark.parametrize('bad', [0, 0.0, -0.1, 1.9001, 2, 10.0, float('nan'), float('inf'),
+                                 True, False, '0.8', None])
+def test_invalid_max_wz_raises_config_error_naming_the_parameter(bad):
+    with pytest.raises(bridge.ConfigError, match='teleop.max_wz'):
+        _teleop_settings_node(max_wz=bad)._read_teleop_settings()
+
+
+@pytest.mark.parametrize('timeout_ms', [50, 100, 300, 1000])
+def test_valid_timeouts_are_accepted_and_applied(monkeypatch, timeout_ms):
+    mono = _patch_monotonic(monkeypatch)
+    node = _teleop_settings_node(timeout_ms=timeout_ms)
+    node._read_teleop_settings()
+    node._teleop_gate.on_teleop('a', tmsg(0), False)
+    mono[0] += timeout_ms / 1000.0
+    assert node._teleop_gate.watchdog_tick().kind == 'idle'
+    mono[0] += 0.0001
+    assert node._teleop_gate.watchdog_tick().kind == 'zero'
+
+
+@pytest.mark.parametrize('bad', [49, 1001, 0, -300, 300.0, 300.5, 0.3, True, False, '300',
+                                 None, float('nan'), float('inf'), 10 ** 9])
+def test_invalid_timeout_ms_raises_config_error_naming_the_parameter(bad):
+    with pytest.raises(bridge.ConfigError, match='teleop.timeout_ms'):
+        _teleop_settings_node(timeout_ms=bad)._read_teleop_settings()
+
+
+@pytest.mark.parametrize('bad', ['true', 'yes', 1, 0, None, 1.0, [True]])
+def test_enabled_that_is_not_a_bool_raises_config_error(bad):
+    with pytest.raises(bridge.ConfigError, match='teleop.enabled'):
+        _teleop_settings_node(enabled=bad)._read_teleop_settings()
+
+
+def test_enabled_false_builds_a_gate_that_refuses_everything():
+    node = _teleop_settings_node(enabled=False)
+    node._read_teleop_settings()
+    assert node._teleop_gate.on_teleop('a', tmsg(0), False).error[0] == 'teleop_disabled'
+
+
+def test_a_failed_read_leaves_no_gate_behind():
+    node = _teleop_settings_node(max_vx=9.0)
+    with pytest.raises(bridge.ConfigError):
+        node._read_teleop_settings()
+    assert node._teleop_gate is None
+
+
+def test_init_raises_config_error_for_an_invalid_teleop_parameter():
+    with pytest.raises(bridge.ConfigError):
+        _init_node({'teleop.max_vx': 0.5})
+
+
+def test_init_builds_the_gate_with_the_default_parameters():
+    node, _ = _init_node({})
+    assert node._teleop_gate is not None
+    node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=0))  # public rclpy clock API
+    assert node._teleop_gate.on_teleop('a', tmsg(0, vx=9), False).twist[0] == 0.2
+
+
+def test_the_shipped_param_files_hold_valid_teleop_values():
+    import os
+    import yaml
+    base = os.path.join(os.path.dirname(__file__), '..', 'param')
+    for name in ('web.yaml', 'web.example.yaml'):
+        with open(os.path.join(base, name), encoding='utf-8') as handle:
+            params = yaml.safe_load(handle)['mtrb_web_bridge']['ros__parameters']['teleop']
+        node = _teleop_settings_node(**params)
+        node._read_teleop_settings()                 # raises ConfigError if out of range
+        assert params['max_vx'] <= bridge.TELEOP_HARD_MAX_VX_MPS
+        assert params['max_wz'] <= bridge.TELEOP_HARD_MAX_WZ_RADPS
+        assert params['timeout_ms'] <= 300 and isinstance(params['enabled'], bool)
+
+
+# --- no sensitive data in the logs ---------------------------------------------------------
+
+def _all_log_text(node):
+    return ' '.join(str(call) for call in node.logger.method_calls)
+
+
+def test_logs_never_contain_teleop_values_payloads_or_tokens(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    secret_msg = {**tmsg(987654321, vx=0.123456, wz=-0.654321), 'token': LEAK_TOKEN}
+    node.teleop(41, secret_msg)
+    node.clock[0] += 0.5
+    node.teleop(41, {**tmsg(987654322), 'vx': 'PAYLOAD-' + LEAK_TOKEN})   # invalid
+    node.teleop(42, {**secret_msg, 'seq': 5})                             # lease held
+    node.teleop(43, secret_msg)                                           # rejected
+    node.send_goal(1.0, 2.0, 0.5)
+    node.teleop(41, secret_msg)                                           # busy
+    node._cmd_vel_nav_pub.always_fail = True
+    node.stop()
+    node.teleop_disconnect(42)
+    text = _all_log_text(node)
+    assert text                                    # the logs are not empty: the test can fail
+    for forbidden in ('0.123456', '0.654321', '987654321', '987654322', 'PAYLOAD',
+                      LEAK_TOKEN):
+        assert forbidden not in text, forbidden
+
+
+def test_rejection_warnings_are_throttled_and_show_only_the_error_code(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.send_goal(1.0, 2.0, 0.5)
+    for seq in range(50):
+        node.teleop(1, tmsg(seq))
+    rejections = [m for m in _warnings(node) if 'Teleop rejected' in m]
+    assert rejections == ['Teleop rejected (teleop_rejected)']
+
+
+def test_teleop_logging_in_the_source_never_references_message_or_velocity_variables():
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(bridge))
+    cls = [n for n in tree.body if isinstance(n, ast.ClassDef)
+           and n.name == 'MtrbWebBridge'][0]
+    teleop_methods = {'teleop', 'teleop_disconnect', 'stop', '_stop_teleop_only',
+                      '_teleop_stop_if_owned', '_teleop_execute', '_teleop_watchdog',
+                      '_publish_cmd_vel_nav', '_nav_busy', '_read_teleop_settings'}
+    forbidden = {'message', 'vx_mps', 'wz_radps', 'twist', 'vx', 'wz', 'seq', 'msg', 'token'}
+    checked = 0
+    for method in cls.body:
+        if not (isinstance(method, ast.FunctionDef) and method.name in teleop_methods):
+            continue
+        for call in ast.walk(method):
+            if not isinstance(call, ast.Call):
+                continue
+            name = getattr(call.func, 'attr', None)
+            if name not in ('debug', 'info', 'warning', 'error', 'fatal', '_warn_throttled'):
+                continue
+            checked += 1
+            used = {n.id for arg in call.args for n in ast.walk(arg) if isinstance(n, ast.Name)}
+            assert not used & forbidden, (method.name, used & forbidden)
+    assert checked >= 6
+
+
+# --- repeated stops: the cancel-all is coalesced, the zeros never are (phase 4) ---------------
+# SAFETY: every stop MUST publish its zero burst; only the cancel-all (which cancels every
+# goal of Nav2) is limited to one per STOP_CANCEL_ALL_MIN_PERIOD_S. Tracked goals and orphans
+# are cancelled on every stop. The coalescing period is measured with time.monotonic, which the
+# tests replace in the bridge module (nothing sleeps).
+
+def _stop_node(monkeypatch, start=10.0):
+    mono = _patch_monotonic(monkeypatch, start=start)
+    return make_teleop_bridge(monkeypatch), mono
+
+
+def cancel_all_count(node):
+    return len(cancel_client(node).requests)
+
+
+def test_the_stop_cancel_all_period_is_half_a_second():
+    assert bridge.STOP_CANCEL_ALL_MIN_PERIOD_S == 0.5
+
+
+def test_repeated_stops_within_the_period_send_a_single_cancel_all(monkeypatch):
+    node, mono = _stop_node(monkeypatch)
+    node.stop()
+    mono[0] += 0.1
+    node.stop()
+    mono[0] += 0.25
+    node.stop()
+    assert cancel_all_count(node) == 1
+    assert_cancel_all_request(cancel_client(node).requests[0])
+
+
+def test_every_repeated_stop_still_publishes_its_zero_burst(monkeypatch):
+    node, mono = _stop_node(monkeypatch)
+    for _ in range(4):
+        node.stop()
+        mono[0] += 0.05
+    assert published(node) == [(0.0, 0.0)] * (4 * ZERO_BURST)
+    assert cancel_all_count(node) == 1
+
+
+def test_a_stop_publishes_its_zeros_before_the_cancel_all_even_when_coalesced(monkeypatch):
+    node, mono = _stop_node(monkeypatch)
+    node.stop()
+    del node.events[:]
+    mono[0] += 0.1
+    node.stop()
+    assert [e[0] for e in node.events] == ['pub'] * ZERO_BURST
+
+
+def test_a_stop_just_before_the_period_ends_is_still_coalesced(monkeypatch):
+    node, mono = _stop_node(monkeypatch)
+    node.stop()
+    mono[0] += 0.4999
+    node.stop()
+    assert cancel_all_count(node) == 1
+
+
+def test_a_stop_after_the_period_sends_another_cancel_all(monkeypatch):
+    node, mono = _stop_node(monkeypatch)
+    node.stop()
+    mono[0] += bridge.STOP_CANCEL_ALL_MIN_PERIOD_S
+    node.stop()
+    assert cancel_all_count(node) == 2
+    mono[0] += 0.4
+    node.stop()                      # coalesced against the second one
+    assert cancel_all_count(node) == 2
+    mono[0] += 0.1
+    node.stop()
+    assert cancel_all_count(node) == 3
+
+
+def test_the_ros_clock_does_not_decide_the_coalescing(monkeypatch):
+    node, mono = _stop_node(monkeypatch)
+    node.stop()
+    node.clock[0] += 1000.0          # ROS time far ahead, monotonic time unchanged
+    node.stop()
+    assert cancel_all_count(node) == 1
+    node.clock[0] -= 5000.0          # ROS time jumps backwards, monotonic advances
+    mono[0] += 0.6
+    node.stop()
+    assert cancel_all_count(node) == 2
+
+
+def test_a_stop_with_a_tracked_goal_cancels_it_every_time_and_sends_no_cancel_all(monkeypatch):
+    node, mono = _stop_node(monkeypatch)
+    handle = accept_goal(node)
+    for _ in range(3):
+        node.stop()
+        mono[0] += 0.05
+    assert [e for e in node.events if e[0] == 'cancel'] == [('cancel',)] * 3
+    assert handle.cancel_calls == 3
+    assert cancel_all_count(node) == 0
+    assert zero_count(node) == 3 * ZERO_BURST
+
+
+def test_a_tracked_goal_is_cancelled_by_a_stop_right_after_a_coalesced_cancel_all(monkeypatch):
+    node, mono = _stop_node(monkeypatch)
+    node.stop()                      # arms and sends the cancel-all at t = 10.0
+    assert cancel_all_count(node) == 1
+    handle = accept_goal(node)       # a goal appears 0 s later
+    mono[0] += 0.1
+    node.stop()
+    assert handle.cancel_calls == 1  # the goal is NOT left driving by the coalescing
+    assert cancel_all_count(node) == 1
+
+
+def test_a_stop_with_orphans_cancels_them_every_time_even_inside_the_period(monkeypatch):
+    node, mono = _stop_node(monkeypatch)
+    node.stop()                      # a cancel-all was armed at t = 10.0
+    handle = make_orphan(node)       # then a goal became an orphan (no handle result)
+    base = handle.cancel_calls
+    for _ in range(3):
+        mono[0] += 0.05
+        node.stop()
+    assert handle.cancel_calls == base + 3
+    assert cancel_all_count(node) == 1    # no new cancel-all while orphans exist
+    assert zero_count(node) == 4 * ZERO_BURST
+
+
+def test_an_api_cancel_is_never_coalesced(monkeypatch):
+    node, mono = _stop_node(monkeypatch)
+    node.stop()
+    mono[0] += 0.1
+    node.cancel()
+    mono[0] += 0.1
+    node.cancel()
+    assert cancel_all_count(node) == 3
+
+
+def test_an_api_cancel_does_not_publish_zeros(monkeypatch):
+    node, _ = _stop_node(monkeypatch)
+    node.cancel()
+    assert published(node) == []
+
+
+def test_the_stop_context_does_not_leak_to_other_threads(monkeypatch):
+    node, _ = _stop_node(monkeypatch)
+    seen = []
+    original = node._request_cancel_all
+
+    def request_with_a_cancel_from_another_thread(stamp_ns):
+        if not seen:
+            seen.append(True)
+            other = threading.Thread(target=node.cancel)   # API cancel, same instant
+            other.start()
+            other.join()
+        return original(stamp_ns)
+
+    node._request_cancel_all = request_with_a_cancel_from_another_thread
+    node.stop()
+    assert cancel_all_count(node) == 2   # the other thread's cancel was not coalesced
+
+
+def test_a_stop_in_another_thread_does_not_coalesce_a_later_api_cancel(monkeypatch):
+    node, _ = _stop_node(monkeypatch)
+    worker = threading.Thread(target=node.stop)
+    worker.start()
+    worker.join()
+    node.cancel()
+    assert cancel_all_count(node) == 2
+
+
+def test_the_stop_context_is_cleared_after_an_exception_in_cancel(monkeypatch):
+    node, mono = _stop_node(monkeypatch)
+    node.stop()                                    # armed at t = 10.0
+    real_cancel = node.cancel
+
+    def failing_cancel():
+        raise RuntimeError('boom')
+
+    node.cancel = failing_cancel
+    mono[0] += 0.1
+    node.stop()                                    # must not raise, zeros still published
+    assert zero_count(node) == 2 * ZERO_BURST
+    node.cancel = real_cancel
+    mono[0] += 0.1
+    node.cancel()                                  # API cancel: would be coalesced if leaked
+    assert cancel_all_count(node) == 2
+
+
+def test_the_stop_context_is_cleared_after_a_failure_inside_the_real_cancel(monkeypatch):
+    node, mono = _stop_node(monkeypatch)
+    real_request = node._request_cancel_all
+
+    def failing_request(stamp_ns):
+        raise RuntimeError('service exploded')
+
+    node._request_cancel_all = failing_request
+    node.stop()                                    # logged, never raised
+    assert zero_count(node) == ZERO_BURST
+    node._request_cancel_all = real_request
+    mono[0] += 0.1
+    node.cancel()
+    assert cancel_all_count(node) == 1
+
+
+# --- main(): shutdown tries the last zero burst ---------------------------------------------
+
+class FakeRclpy:
+    """Public rclpy module API used by main(): init, ok, shutdown, logging.get_logger."""
+
+    def __init__(self, ok=True):
+        self.ok_value = ok
+        self.calls = []
+        self.errors = []
+        self.logging = NS(get_logger=lambda name: NS(error=self.errors.append))
+
+    def init(self, args=None):
+        self.calls.append('init')
+
+    def ok(self):
+        return self.ok_value
+
+    def shutdown(self):
+        self.calls.append('shutdown')
+
+
+def _main_setup(monkeypatch, spin=None, ok=True, build_error=None):
+    """Run main() against a node built like the teleop tests; returns (node, rclpy, result)."""
+    node = make_teleop_bridge(monkeypatch)
+    rclpy_double = FakeRclpy(ok=ok)
+
+    class Executor:
+        def __init__(self, num_threads=None):
+            pass
+
+        def add_node(self, added):
+            assert added is node
+
+        def spin(self):
+            node.events.append(('spin',))
+            if spin is not None:
+                raise spin
+
+    def build():
+        if build_error is not None:
+            raise build_error
+        return node
+
+    node.start_server = lambda: node.events.append(('start_server',))
+    node.stop_server = lambda: node.events.append(('stop_server',))
+    node.destroy_node = lambda: node.events.append(('destroy_node',))
+    monkeypatch.setattr(bridge, 'rclpy', rclpy_double)
+    monkeypatch.setattr(bridge, 'MtrbWebBridge', build)
+    monkeypatch.setattr(bridge, 'MultiThreadedExecutor', Executor)
+    return node, rclpy_double
+
+
+def _kinds(node):
+    return [e[0] for e in node.events]
+
+
+def test_main_publishes_the_last_zero_burst_at_shutdown_before_stopping_the_server(
+        monkeypatch):
+    node, rclpy_double = _main_setup(monkeypatch, spin=KeyboardInterrupt())
+    assert bridge.main() == 0
+    assert _kinds(node) == ['start_server', 'spin'] + ['pub'] * ZERO_BURST + [
+        'stop_server', 'destroy_node']
+    assert published(node) == [(0.0, 0.0)] * ZERO_BURST
+    assert rclpy_double.calls == ['init', 'shutdown']
+
+
+def test_main_publishes_the_last_zero_burst_also_when_the_spin_dies_with_an_error(monkeypatch):
+    node, rclpy_double = _main_setup(monkeypatch, spin=RuntimeError('executor died'))
+    with pytest.raises(RuntimeError, match='executor died'):
+        bridge.main()
+    assert published(node) == [(0.0, 0.0)] * ZERO_BURST
+    assert _kinds(node)[-2:] == ['stop_server', 'destroy_node']
+    assert rclpy_double.calls == ['init', 'shutdown']
+
+
+def test_main_a_failing_publisher_does_not_break_the_shutdown(monkeypatch):
+    node, rclpy_double = _main_setup(monkeypatch, spin=KeyboardInterrupt())
+    node._cmd_vel_nav_pub.always_fail = True        # e.g. the context is already shut down
+    assert bridge.main() == 0
+    assert node._cmd_vel_nav_pub.attempts == ZERO_BURST   # it still tried every zero
+    assert _kinds(node)[-2:] == ['stop_server', 'destroy_node']
+    assert rclpy_double.calls == ['init', 'shutdown']
+
+
+def test_main_with_the_context_already_shut_down_still_stops_server_and_node(monkeypatch):
+    node, rclpy_double = _main_setup(monkeypatch, spin=KeyboardInterrupt(), ok=False)
+    node._cmd_vel_nav_pub.always_fail = True
+    assert bridge.main() == 0
+    assert _kinds(node)[-2:] == ['stop_server', 'destroy_node']
+    assert rclpy_double.calls == ['init']           # nothing to shut down twice
+
+
+def test_main_an_exception_in_the_final_stop_is_logged_and_does_not_break_the_shutdown(
+        monkeypatch):
+    node, rclpy_double = _main_setup(monkeypatch, spin=KeyboardInterrupt())
+
+    def exploding_stop():
+        raise RuntimeError('publisher gone')
+
+    node._stop_teleop_only = exploding_stop
+    assert bridge.main() == 0
+    assert _kinds(node)[-2:] == ['stop_server', 'destroy_node']
+    assert rclpy_double.calls == ['init', 'shutdown']
+    assert len(rclpy_double.errors) == 1
+    assert 'publisher gone' in rclpy_double.errors[0]
+
+
+def test_main_with_an_invalid_configuration_returns_1_and_touches_no_node(monkeypatch):
+    node, rclpy_double = _main_setup(monkeypatch, build_error=bridge.ConfigError('bad port'))
+    assert bridge.main() == 1
+    assert node.events == []                         # no zeros, nothing to stop
+    assert rclpy_double.errors == ['bad port']
+    assert rclpy_double.calls == ['init', 'shutdown']
+
+
+# =============================================================================================
+# Phase 5: odometry age, lifecycle polling, map services (MapPort) and new settings.
+#
+# The service clients and futures below are fakes that expose ONLY the public rclpy API that
+# the node may use (checked against the rclpy Jazzy sources, rclpy/client.py and task.py):
+#   Client.service_is_ready(), Client.call_async(request) -> Future,
+#   Client.remove_pending_request(future);
+#   Future.add_done_callback(cb), done(), result(), exception(), set_result(), set_exception().
+# Any other attribute access on them raises AttributeError, so a call to an API that does not
+# exist (the lesson of the earlier phases) fails here instead of on the robot. NOT covered
+# (needs real ROS / the Pi): the real DDS discovery, the executor scheduling the callbacks and
+# slam_toolbox writing the files (risk A-2 of the spec).
+# =============================================================================================
+
+WAIT_S = 10.0   # upper bound while waiting for another thread (never reached when all is well)
+
+
+class RclFuture:
+    """Public-API model of rclpy.task.Future (callbacks run at once when already done)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._done = False
+        self._result = None
+        self._exception = None
+        self._callbacks = []
+
+    def done(self):
+        return self._done
+
+    def result(self):
+        if self._exception is not None:
+            raise self._exception
+        return self._result
+
+    def exception(self):
+        return self._exception
+
+    def add_done_callback(self, callback):
+        with self._lock:
+            if not self._done:
+                self._callbacks.append(callback)
+                return
+        callback(self)
+
+    def _finish(self):
+        with self._lock:
+            self._done = True
+            callbacks, self._callbacks = self._callbacks, []
+        for callback in callbacks:
+            callback(self)
+
+    def set_result(self, result):
+        self._result = result
+        self._finish()
+
+    def set_exception(self, exception):
+        self._exception = exception
+        self._finish()
+
+
+class SrvClient:
+    """Public-API model of rclpy.client.Client (see the block comment above)."""
+
+    def __init__(self, srv_type, name=''):
+        self.srv_type = srv_type
+        self.name = name
+        self.ready = True
+        self.call_error = None
+        self.requests = []
+        self.futures = []
+        self.pending = []           # futures that can still receive an answer
+        self.removed = []           # futures passed to remove_pending_request, in order
+        self.ready_error = None
+        self.on_call = None         # callable(future) run inside call_async
+        self.probe = None           # callable run at the start of every public method
+        self.auto_answer = None     # value: call_async returns an already answered future
+
+    def _probe(self):
+        if self.probe is not None:
+            self.probe()
+
+    def service_is_ready(self):
+        self._probe()
+        if self.ready_error is not None:
+            raise self.ready_error
+        return self.ready
+
+    def call_async(self, request):
+        self._probe()
+        if not isinstance(request, self.srv_type.Request):   # as the real Client does
+            raise TypeError()
+        if self.call_error is not None:
+            raise self.call_error
+        future = RclFuture()
+        self.requests.append(request)
+        self.futures.append(future)
+        self.pending.append(future)
+        if self.auto_answer is not None:
+            self.answer(future, self.auto_answer)
+        if self.on_call is not None:
+            self.on_call(future)
+        return future
+
+    def remove_pending_request(self, future):
+        self._probe()
+        self.removed.append(future)
+        if future in self.pending:
+            self.pending.remove(future)
+
+    def answer(self, future, response):
+        """Deliver an answer like the executor does; dropped if the request was removed."""
+        if future not in self.pending:
+            return False
+        self.pending.remove(future)
+        future.set_result(response)
+        return True
+
+    def fail(self, future, error):
+        if future in self.pending:
+            self.pending.remove(future)
+            future.set_exception(error)
+
+
+def lifecycle_state(label):
+    return NS(current_state=NS(label=label))
+
+
+def make_lifecycle_node(names=('amcl', 'planner_server'), now=100.0):
+    """Node built like production: _init_status_io with a fake create_client."""
+    node = make_bridge(now)
+    node._status_nodes = tuple(names)
+    node.created = {}
+
+    def create_client(srv_type, name, callback_group=None):
+        node.created[name] = SrvClient(srv_type, name)
+        return node.created[name]
+
+    node.create_client = create_client
+    node.create_subscription = mock.Mock()
+    node.create_timer = mock.Mock()
+    node._init_status_io()
+    return node
+
+
+def lifecycle_client(node, name):
+    return node._lifecycle_clients[name]
+
+
+def states(node):
+    return node._lifecycle_snapshot()
+
+
+def run_in_thread(function, *args):
+    """Run `function` in a daemon thread; return (thread, box) with value/error in box."""
+    box = {}
+
+    def target():
+        try:
+            box['value'] = function(*args)
+        except BaseException as err:  # noqa: B902 - handed to the test
+            box['error'] = err
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread, box
+
+
+# --- odometry age ------------------------------------------------------------------------
+
+def test_status_odom_age_is_null_until_an_odometry_message_arrives():
+    node = make_bridge()
+    node._broadcast_status()
+    message = drain(node)[0]
+    assert 'odom_age' in message and message['odom_age'] is None
+
+
+def test_status_odom_age_is_the_seconds_since_the_last_odometry_message():
+    node = make_bridge(100.0)
+    node._on_odom(object())             # the content is never read
+    node.clock[0] = 102.5
+    node._broadcast_status()
+    assert drain(node)[0]['odom_age'] == 2.5
+
+
+def test_status_odom_age_is_zero_right_after_a_message_and_resets_with_a_newer_one():
+    node = make_bridge(100.0)
+    node._on_odom(None)
+    node._broadcast_status()
+    assert drain(node)[0]['odom_age'] == 0.0
+    node.clock[0] = 110.0
+    node._on_odom(None)
+    node.clock[0] = 110.25
+    node._broadcast_status()
+    assert drain(node)[0]['odom_age'] == 0.25
+
+
+def test_status_odom_age_is_rounded_to_two_decimals():
+    node = make_bridge(100.0)
+    node._on_odom(None)
+    node.clock[0] = 101.23456
+    node._broadcast_status()
+    assert drain(node)[0]['odom_age'] == 1.23
+
+
+def test_status_odom_age_is_never_negative_when_the_clock_goes_back():
+    node = make_bridge(100.0)
+    node._on_odom(None)
+    node.clock[0] = 90.0
+    node._broadcast_status()
+    assert drain(node)[0]['odom_age'] == 0.0
+
+
+def test_status_odom_age_is_independent_of_the_scan_age():
+    node = make_bridge(100.0)
+    node._on_odom(None)
+    node.clock[0] = 103.0
+    node._on_scan(_scan())
+    node.clock[0] = 104.0
+    node._broadcast_status()
+    message = drain(node)[0]
+    assert (message['odom_age'], message['scan_age']) == (4.0, 1.0)
+
+
+def test_status_message_has_exactly_the_contracted_fields():
+    node = make_bridge()
+    node._broadcast_status()
+    assert set(drain(node)[0]) == {'type', 'battery_pct', 'mode', 'nodes', 'scan_age',
+                                   'odom_age', 'dock'}
+
+
+def test_init_ros_io_subscribes_to_odom_with_sensor_data_qos_and_reads_only_its_arrival():
+    node = _io_node()
+    calls = [c for c in node.create_subscription.call_args_list if c.args[1] == 'odom']
+    assert len(calls) == 1
+    assert calls[0].args[0] is bridge.Odometry
+    assert calls[0].args[2] == node._on_odom
+    assert calls[0].args[3] is bridge.qos_profile_sensor_data
+    assert not calls[0].args[1].startswith('/')      # relative: /<ns>/odom
+
+
+# --- lifecycle clients and timer ---------------------------------------------------------
+
+def test_init_ros_io_creates_one_get_state_client_per_node_with_relative_names():
+    node = _io_node()
+    calls = {c.args[1]: c.args[0] for c in node.create_client.call_args_list
+             if c.args[1].endswith('/get_state')}
+    assert calls == {'map_server/get_state': bridge.GetState, 'amcl/get_state': bridge.GetState}
+    assert set(node._lifecycle_clients) == {'map_server', 'amcl'}
+    for name, client in node._lifecycle_clients.items():
+        assert client is node.created_clients[f'{name}/get_state']
+
+
+def test_init_ros_io_creates_the_two_slam_toolbox_service_clients():
+    node = _io_node()
+    by_name = {c.args[1]: c for c in node.create_client.call_args_list}
+    assert by_name['slam_toolbox/save_map'].args[0] is bridge.SaveMap
+    assert by_name['slam_toolbox/serialize_map'].args[0] is bridge.SerializePoseGraph
+    assert node._save_map_client is node.created_clients['slam_toolbox/save_map']
+    assert node._serialize_client is node.created_clients['slam_toolbox/serialize_map']
+    assert all(not name.startswith('/') for name in by_name)
+    groups = [by_name[n].kwargs.get('callback_group')
+              for n in ('slam_toolbox/save_map', 'slam_toolbox/serialize_map')]
+    assert all(isinstance(g, bridge.ReentrantCallbackGroup) for g in groups)
+
+
+def test_init_ros_io_creates_exactly_the_expected_clients():
+    node = _io_node()
+    names = sorted(c.args[1] for c in node.create_client.call_args_list)
+    assert names == sorted([
+        'navigate_to_pose/_action/cancel_goal', 'map_server/get_state', 'amcl/get_state',
+        'slam_toolbox/save_map', 'slam_toolbox/serialize_map'])
+
+
+def test_lifecycle_polling_has_its_own_mutually_exclusive_callback_group():
+    node = _io_node()
+    timer = [c for c in node.create_timer.call_args_list
+             if c.args[1].__name__ == '_poll_lifecycle'][0]
+    group = timer.kwargs['callback_group']
+    assert isinstance(group, bridge.MutuallyExclusiveCallbackGroup)
+    for name in ('map_server', 'amcl'):
+        call = [c for c in node.create_client.call_args_list
+                if c.args[1] == f'{name}/get_state'][0]
+        assert call.kwargs['callback_group'] is group
+    assert timer.args[0] == pytest.approx(2.0)
+
+
+def test_lifecycle_states_start_unknown_for_every_watched_node():
+    node = make_lifecycle_node(('a', 'b', 'c'))
+    assert states(node) == {'a': 'unknown', 'b': 'unknown', 'c': 'unknown'}
+    assert list(states(node)) == ['a', 'b', 'c']
+
+
+def test_no_watched_nodes_gives_empty_nodes_in_status():
+    node = make_lifecycle_node(())
+    node._poll_lifecycle()
+    node._broadcast_status()
+    assert drain(node)[0]['nodes'] == {}
+
+
+# --- _poll_lifecycle ---------------------------------------------------------------------
+
+def test_poll_asks_every_ready_node_once_with_a_get_state_request():
+    node = make_lifecycle_node(('amcl', 'planner_server'))
+    node._poll_lifecycle()
+    for name in ('amcl', 'planner_server'):
+        client = lifecycle_client(node, name)
+        assert len(client.requests) == 1
+        assert isinstance(client.requests[0], bridge.GetState.Request)
+    assert states(node) == {'amcl': 'unknown', 'planner_server': 'unknown'}   # not answered yet
+
+
+@pytest.mark.parametrize('label', sorted(bridge.LIFECYCLE_LABELS))
+def test_poll_stores_every_valid_lifecycle_label(label):
+    node = make_lifecycle_node(('amcl',))
+    node._poll_lifecycle()
+    client = lifecycle_client(node, 'amcl')
+    client.answer(client.futures[0], lifecycle_state(label))
+    assert states(node) == {'amcl': label}
+
+
+def test_poll_results_reach_the_status_message_nodes_field():
+    node = make_lifecycle_node(('amcl', 'bt_navigator'))
+    node._poll_lifecycle()
+    client = lifecycle_client(node, 'amcl')
+    client.answer(client.futures[0], lifecycle_state('active'))
+    lifecycle_client(node, 'bt_navigator').ready = False
+    node._poll_lifecycle()      # amcl is asked again (its label stays until the next tick)
+    node._broadcast_status()
+    assert drain(node)[0]['nodes'] == {'amcl': 'active', 'bt_navigator': 'unavailable'}
+
+
+@pytest.mark.parametrize('label', ['ACTIVE', ' Active ', 'Inactive\n'])
+def test_poll_normalises_case_and_whitespace_of_the_label(label):
+    node = make_lifecycle_node(('amcl',))
+    node._poll_lifecycle()
+    client = lifecycle_client(node, 'amcl')
+    client.answer(client.futures[0], lifecycle_state(label))
+    assert states(node)['amcl'] == label.strip().lower()
+
+
+@pytest.mark.parametrize('label', ['weird', '', 'running', 'active; DROP', None, 5, 'x' * 500,
+                                   'actív'])
+def test_poll_maps_an_unknown_label_to_unknown(label):
+    node = make_lifecycle_node(('amcl',))
+    node._poll_lifecycle()
+    client = lifecycle_client(node, 'amcl')
+    client.answer(client.futures[0], lifecycle_state(label))
+    assert states(node) == {'amcl': 'unknown'}
+
+
+@pytest.mark.parametrize('response', [None, NS(), NS(current_state=None), 'garbage', 5])
+def test_poll_maps_a_malformed_response_to_unknown(response):
+    node = make_lifecycle_node(('amcl',))
+    node._poll_lifecycle()
+    client = lifecycle_client(node, 'amcl')
+    client.answer(client.futures[0], response)
+    assert states(node) == {'amcl': 'unknown'}
+
+
+def test_poll_maps_an_answer_with_an_exception_to_unknown():
+    node = make_lifecycle_node(('amcl',))
+    node._poll_lifecycle()
+    client = lifecycle_client(node, 'amcl')
+    client.answer(client.futures[0], lifecycle_state('active'))
+    assert states(node)['amcl'] == 'active'
+    node._poll_lifecycle()
+    client.fail(client.futures[1], RuntimeError('service died'))
+    assert states(node)['amcl'] == 'unknown'
+
+
+def test_poll_a_service_that_is_not_ready_is_unavailable_and_is_not_called():
+    node = make_lifecycle_node(('amcl',))
+    lifecycle_client(node, 'amcl').ready = False
+    node._poll_lifecycle()
+    assert states(node) == {'amcl': 'unavailable'}
+    assert lifecycle_client(node, 'amcl').requests == []
+    assert node._lifecycle_pending == {}
+
+
+def test_poll_a_node_that_disappears_becomes_unavailable_and_returns_when_it_is_back():
+    node = make_lifecycle_node(('amcl',))
+    client = lifecycle_client(node, 'amcl')
+    node._poll_lifecycle()
+    client.answer(client.futures[0], lifecycle_state('active'))
+    client.ready = False
+    node._poll_lifecycle()
+    assert states(node)['amcl'] == 'unavailable'
+    client.ready = True
+    node._poll_lifecycle()
+    client.answer(client.futures[-1], lifecycle_state('inactive'))
+    assert states(node)['amcl'] == 'inactive'
+
+
+@pytest.mark.parametrize('error', [RuntimeError('boom'), TypeError(), OSError('closed')])
+def test_poll_a_call_async_that_raises_gives_unknown_and_never_stops_the_timer(error):
+    node = make_lifecycle_node(('amcl', 'planner_server'))
+    lifecycle_client(node, 'amcl').call_error = error
+    node._poll_lifecycle()                       # must not raise
+    assert states(node)['amcl'] == 'unknown'
+    assert len(lifecycle_client(node, 'planner_server').requests) == 1   # the others go on
+    assert node._lifecycle_pending.keys() == {'planner_server'}
+    assert node.logger.warning.called
+
+
+def test_poll_a_service_is_ready_that_raises_is_handled_like_a_failed_query():
+    node = make_lifecycle_node(('amcl',))
+    lifecycle_client(node, 'amcl').ready_error = RuntimeError('context gone')
+    node._poll_lifecycle()
+    assert states(node) == {'amcl': 'unknown'}
+
+
+def test_poll_failure_warnings_are_throttled():
+    node = make_lifecycle_node(('amcl',))
+    lifecycle_client(node, 'amcl').call_error = RuntimeError('boom')
+    for _ in range(5):
+        node._poll_lifecycle()
+    assert node.logger.warning.call_count == 1
+    node.clock[0] += bridge.LOG_THROTTLE_S + 1
+    node._poll_lifecycle()
+    assert node.logger.warning.call_count == 2
+
+
+def test_poll_a_request_still_pending_is_removed_and_the_state_becomes_unknown():
+    node = make_lifecycle_node(('amcl',))
+    client = lifecycle_client(node, 'amcl')
+    node._poll_lifecycle()
+    client.answer(client.futures[0], lifecycle_state('active'))
+    node._poll_lifecycle()                      # second request: never answered
+    assert states(node)['amcl'] == 'active'     # the old label stays until a tick says otherwise
+    node._poll_lifecycle()                      # third tick finds the second still pending
+    assert client.removed == [client.futures[1]]   # real remove_pending_request, once
+    assert states(node)['amcl'] == 'unknown'
+    assert len(client.requests) == 3
+
+
+def test_poll_pending_requests_do_not_accumulate_when_the_service_never_answers():
+    node = make_lifecycle_node(('amcl', 'bt_navigator'))
+    for _ in range(50):
+        node._poll_lifecycle()
+    for name in ('amcl', 'bt_navigator'):
+        client = lifecycle_client(node, name)
+        assert len(client.pending) == 1             # only the latest request is alive
+        assert len(client.removed) == 49
+    assert len(node._lifecycle_pending) == 2
+
+
+def test_poll_a_late_answer_to_a_removed_request_is_dropped_by_rclpy_and_changes_nothing():
+    node = make_lifecycle_node(('amcl',))
+    client = lifecycle_client(node, 'amcl')
+    node._poll_lifecycle()
+    node._poll_lifecycle()                       # drops request 0
+    assert client.answer(client.futures[0], lifecycle_state('active')) is False
+    assert states(node)['amcl'] == 'unknown'
+
+
+def test_poll_a_late_answer_with_an_old_sequence_never_overwrites_a_newer_state():
+    # Defence in depth: even if an answer slipped through remove_pending_request (done
+    # callback already scheduled on the executor), its sequence number is old.
+    node = make_lifecycle_node(('amcl',))
+    client = lifecycle_client(node, 'amcl')
+    node._poll_lifecycle()
+    old = client.futures[0]
+    node._poll_lifecycle()
+    node._poll_lifecycle()                       # state 'unknown', request 2 pending
+    old.set_result(lifecycle_state('active'))    # bypasses the client: a late delivery
+    node._on_lifecycle('amcl', 1, old)
+    assert states(node)['amcl'] == 'unknown'
+    client.answer(client.futures[2], lifecycle_state('inactive'))
+    assert states(node)['amcl'] == 'inactive'
+    node._on_lifecycle('amcl', 1, old)           # older again after a newer answer
+    assert states(node)['amcl'] == 'inactive'
+
+
+def test_poll_an_answer_clears_the_pending_entry_so_the_next_tick_removes_nothing():
+    node = make_lifecycle_node(('amcl',))
+    client = lifecycle_client(node, 'amcl')
+    node._poll_lifecycle()
+    client.answer(client.futures[0], lifecycle_state('active'))
+    assert node._lifecycle_pending == {}
+    node._poll_lifecycle()
+    assert client.removed == []
+    assert states(node)['amcl'] == 'active'
+
+
+def test_poll_an_already_answered_future_is_handled_without_deadlock():
+    node = make_lifecycle_node(('amcl',))
+    lifecycle_client(node, 'amcl').auto_answer = lifecycle_state('active')
+    thread, box = run_in_thread(node._poll_lifecycle)
+    thread.join(WAIT_S)
+    assert not thread.is_alive(), '_poll_lifecycle deadlocked on its own done callback'
+    assert 'error' not in box
+    assert states(node) == {'amcl': 'active'}
+    assert node._lifecycle_pending == {}
+
+
+def test_poll_never_holds_the_lifecycle_lock_while_it_talks_to_the_clients():
+    node = make_lifecycle_node(('amcl', 'bt_navigator'))
+    seen = []
+    for name in ('amcl', 'bt_navigator'):
+        lifecycle_client(node, name).probe = lambda: seen.append(node._lifecycle_lock.locked())
+    node._poll_lifecycle()
+    node._poll_lifecycle()      # the second tick also calls remove_pending_request
+    assert seen and not any(seen)
+
+
+def test_poll_never_holds_the_teleop_or_navigation_locks():
+    node = make_lifecycle_node(('amcl',))
+    seen = []
+    lifecycle_client(node, 'amcl').probe = lambda: seen.append(
+        (node._teleop_lock.locked(), node._nav_lock.locked()))
+    node._poll_lifecycle()
+    node._poll_lifecycle()
+    assert seen and set(seen) == {(False, False)}
+
+
+def test_poll_only_uses_the_public_client_api():
+    # SrvClient has nothing but the public methods: any other call raises AttributeError.
+    public = {name for name in dir(SrvClient) if not name.startswith('_')}
+    assert {'service_is_ready', 'call_async', 'remove_pending_request'} <= public
+    node = make_lifecycle_node(('amcl',))
+    node._poll_lifecycle()
+    node._poll_lifecycle()
+    assert states(node)['amcl'] == 'unknown'
+
+
+def test_the_lifecycle_snapshot_is_a_copy():
+    node = make_lifecycle_node(('amcl',))
+    snapshot = node._lifecycle_snapshot()
+    snapshot['amcl'] = 'hacked'
+    snapshot['extra'] = 'x'
+    assert states(node) == {'amcl': 'unknown'}
+
+
+def test_a_status_broadcast_does_not_wait_for_a_pending_lifecycle_request():
+    node = make_lifecycle_node(('amcl',))
+    node._poll_lifecycle()                       # pending forever
+    thread, box = run_in_thread(node._broadcast_status)
+    thread.join(WAIT_S)
+    assert not thread.is_alive() and 'error' not in box
+    assert drain(node)[0]['nodes'] == {'amcl': 'unknown'}
+
+
+# --- _call_service -----------------------------------------------------------------------
+
+call_service = bridge.MtrbWebBridge._call_service
+
+
+def test_call_service_not_ready_raises_unavailable_without_sending():
+    client = SrvClient(bridge.SaveMap)
+    client.ready = False
+    with pytest.raises(bridge.SlamUnavailableError):
+        call_service(client, bridge.SaveMap.Request(), 1.0)
+    assert client.requests == []
+
+
+@pytest.mark.parametrize('error', [RuntimeError('x'), TypeError(), ValueError('y'),
+                                   OSError('z')])
+def test_call_service_a_call_async_that_raises_is_unavailable(error):
+    client = SrvClient(bridge.SaveMap)
+    client.call_error = error
+    with pytest.raises(bridge.SlamUnavailableError):
+        call_service(client, bridge.SaveMap.Request(), 1.0)
+
+
+def test_call_service_returns_the_response_when_it_is_already_there():
+    client = SrvClient(bridge.SaveMap)
+    response = NS(result=0)
+    client.auto_answer = response
+    assert call_service(client, bridge.SaveMap.Request(), 0.0) is response
+
+
+def test_call_service_returns_the_response_delivered_by_another_thread():
+    client = SrvClient(bridge.SaveMap)
+    sent = threading.Event()
+    client.on_call = lambda future: sent.set()
+    response = NS(result=0)
+    thread, box = run_in_thread(call_service, client, bridge.SaveMap.Request(), WAIT_S)
+    assert sent.wait(WAIT_S)
+    client.answer(client.futures[0], response)
+    thread.join(WAIT_S)
+    assert not thread.is_alive()
+    assert box == {'value': response}
+
+
+def test_call_service_timeout_raises_timeout_and_removes_the_pending_request_once():
+    client = SrvClient(bridge.SaveMap)
+    with pytest.raises(bridge.SlamTimeoutError):
+        call_service(client, bridge.SaveMap.Request(), 0.0)
+    assert client.removed == [client.futures[0]]
+    assert client.pending == []
+
+
+def test_call_service_a_late_answer_after_the_timeout_is_dropped():
+    client = SrvClient(bridge.SaveMap)
+    with pytest.raises(bridge.SlamTimeoutError):
+        call_service(client, bridge.SaveMap.Request(), 0.0)
+    assert client.answer(client.futures[0], NS(result=0)) is False
+    assert not client.futures[0].done()
+
+
+def test_call_service_an_answer_with_an_exception_returns_none():
+    client = SrvClient(bridge.SaveMap)
+    client.on_call = lambda future: future.set_exception(RuntimeError('server died'))
+    assert call_service(client, bridge.SaveMap.Request(), 1.0) is None
+
+
+def test_call_service_removes_nothing_when_the_answer_arrives_in_time():
+    client = SrvClient(bridge.SaveMap)
+    client.auto_answer = NS(result=0)
+    call_service(client, bridge.SaveMap.Request(), 1.0)
+    assert client.removed == []
+
+
+def test_call_service_does_not_need_the_node_and_takes_no_lock():
+    # A staticmethod: nothing of the node (no _teleop_lock, _nav_lock) can be involved.
+    assert isinstance(bridge.MtrbWebBridge.__dict__['_call_service'], staticmethod)
+
+
+# --- MapPort of the node -----------------------------------------------------------------
+
+def make_map_node(monkeypatch=None, teleop=False):
+    node = make_teleop_bridge(monkeypatch) if teleop else make_bridge()
+    node._save_map_client = SrvClient(bridge.SaveMap, 'slam_toolbox/save_map')
+    node._serialize_client = SrvClient(bridge.SerializePoseGraph, 'slam_toolbox/serialize_map')
+    return node
+
+
+def test_the_node_is_a_map_port_that_overrides_every_method():
+    assert issubclass(bridge.MtrbWebBridge, bridge.MapPort)
+    for name in ('ready', 'save_map', 'serialize_posegraph'):
+        assert getattr(bridge.MtrbWebBridge, name) is not getattr(bridge.MapPort, name)
+
+
+@pytest.mark.parametrize('ready', [True, False])
+def test_map_port_ready_follows_the_save_map_service(ready):
+    node = make_map_node()
+    node._save_map_client.ready = ready
+    assert node.ready() is ready
+    assert node._save_map_client.requests == []
+
+
+def test_map_port_save_map_sends_the_base_path_as_a_string_message():
+    node = make_map_node()
+    node._save_map_client.auto_answer = NS(result=bridge.SaveMap.Response.RESULT_SUCCESS)
+    assert node.save_map('/maps/lab', 1.0) is True
+    [request] = node._save_map_client.requests
+    assert request.name.data == '/maps/lab'
+    assert node._serialize_client.requests == []
+
+
+def test_map_port_save_map_false_when_slam_toolbox_reports_an_error():
+    node = make_map_node()
+    node._save_map_client.auto_answer = NS(result=1)
+    assert node.save_map('/maps/lab', 1.0) is False
+
+
+def test_map_port_save_map_false_when_the_answer_failed():
+    node = make_map_node()
+    node._save_map_client.on_call = lambda f: f.set_exception(RuntimeError('x'))
+    assert node.save_map('/maps/lab', 1.0) is False
+
+
+def test_map_port_save_map_propagates_unavailable_and_timeout():
+    node = make_map_node()
+    with pytest.raises(bridge.SlamTimeoutError):
+        node.save_map('/maps/lab', 0.0)
+    node._save_map_client.ready = False
+    with pytest.raises(bridge.SlamUnavailableError):
+        node.save_map('/maps/lab', 0.0)
+
+
+def test_map_port_serialize_posegraph_sends_the_filename_and_maps_the_result():
+    node = make_map_node()
+    node._serialize_client.auto_answer = NS(
+        result=bridge.SerializePoseGraph.Response.RESULT_SUCCESS)
+    assert node.serialize_posegraph('/maps/lab', 1.0) is True
+    [request] = node._serialize_client.requests
+    assert request.filename == '/maps/lab'
+    assert node._save_map_client.requests == []
+    node._serialize_client.auto_answer = NS(result=1)
+    assert node.serialize_posegraph('/maps/lab', 1.0) is False
+
+
+def test_map_port_serialize_posegraph_propagates_unavailable_and_timeout():
+    node = make_map_node()
+    with pytest.raises(bridge.SlamTimeoutError):
+        node.serialize_posegraph('/maps/lab', 0.0)
+    node._serialize_client.ready = False
+    with pytest.raises(bridge.SlamUnavailableError):
+        node.serialize_posegraph('/maps/lab', 0.0)
+
+
+def test_map_port_a_blocked_save_holds_no_node_lock_and_stop_still_publishes_zeros(
+        monkeypatch):
+    node = make_map_node(monkeypatch, teleop=True)
+    sent = threading.Event()
+    node._save_map_client.on_call = lambda future: sent.set()
+    thread, box = run_in_thread(node.save_map, '/maps/lab', WAIT_S)
+    stop_thread = None
+    try:
+        assert sent.wait(WAIT_S)
+        # The HTTP thread is now waiting inside the service call: it must hold no lock.
+        for lock in (node._teleop_lock, node._nav_lock, node._lifecycle_lock):
+            assert lock.acquire(blocking=False), 'a map save holds a node lock'
+            lock.release()
+        stop_thread, stop_box = run_in_thread(node.stop)
+        stop_thread.join(WAIT_S)
+        assert not stop_thread.is_alive(), 'stop() waited for the map save'
+        assert 'error' not in stop_box
+        assert published(node)[:ZERO_BURST] == [(0.0, 0.0)] * ZERO_BURST
+        assert thread.is_alive()                  # the save is still waiting for slam_toolbox
+    finally:
+        node._save_map_client.answer(node._save_map_client.futures[0], NS(result=0))
+        thread.join(WAIT_S)
+        if stop_thread is not None:
+            stop_thread.join(WAIT_S)
+    assert box == {'value': True}
+
+
+def test_map_port_a_teleop_command_is_not_delayed_by_a_blocked_save(monkeypatch):
+    node = make_map_node(monkeypatch, teleop=True)
+    sent = threading.Event()
+    node._serialize_client.on_call = lambda future: sent.set()
+    thread, box = run_in_thread(node.serialize_posegraph, '/maps/lab', WAIT_S)
+    teleop_thread = None
+    try:
+        assert sent.wait(WAIT_S)
+        teleop_thread, teleop_box = run_in_thread(node.teleop, 1, tmsg(0))
+        teleop_thread.join(WAIT_S)
+        assert not teleop_thread.is_alive(), 'teleop waited for the map save'
+        assert teleop_box == {'value': None}
+        assert published(node) == [(0.1, 0.2)]
+    finally:
+        node._serialize_client.answer(node._serialize_client.futures[0], NS(result=0))
+        thread.join(WAIT_S)
+        if teleop_thread is not None:
+            teleop_thread.join(WAIT_S)
+    assert box == {'value': True}
+
+
+def test_init_map_clients_uses_relative_service_names_and_a_reentrant_group():
+    node = object.__new__(bridge.MtrbWebBridge)
+    node.create_client = mock.Mock()
+    node._init_map_clients()
+    names = [c.args[1] for c in node.create_client.call_args_list]
+    assert names == [bridge.SAVE_MAP_SERVICE, bridge.SERIALIZE_MAP_SERVICE]
+    assert names == ['slam_toolbox/save_map', 'slam_toolbox/serialize_map']
+    groups = [c.kwargs['callback_group'] for c in node.create_client.call_args_list]
+    assert isinstance(groups[0], bridge.ReentrantCallbackGroup) and groups[0] is groups[1]
+
+
+def test_log_map_event_routes_levels_to_the_node_logger():
+    node = make_bridge()
+    node._log_map_event('info', 'saved')
+    node._log_map_event('warning', 'careful')
+    node._log_map_event('error', 'bad')
+    node._log_map_event('weird', 'default')
+    assert [c.args[0] for c in node.logger.info.call_args_list] == ['saved', 'default']
+    assert [c.args[0] for c in node.logger.warning.call_args_list] == ['careful']
+    assert [c.args[0] for c in node.logger.error.call_args_list] == ['bad']
+
+
+# --- settings: rates.lifecycle, status.nodes, map_dir, union by mode ---------------------
+
+@pytest.fixture
+def share(monkeypatch):
+    monkeypatch.setattr(bridge, 'get_package_share_directory', lambda name: '/share')
+
+
+@pytest.mark.parametrize('rate, period', [(0.5, 2.0), (0.05, 20.0), (0.25, 4.0), (0.1, 10.0),
+                                          (0.2, 5.0)])
+def test_read_settings_lifecycle_rate_sets_the_polling_period(rate, period):
+    node = _settings_node(**{'rates.lifecycle': rate})
+    node._read_settings()
+    assert node._lifecycle_period_s == pytest.approx(period)
+
+
+@pytest.mark.parametrize('bad', [0.51, 0.5001, 1, 1.0, 2.0, 10.0, 100, 0.0499, 0.04, 0.01,
+                                 0, 0.0, -0.5, True, False, float('nan'), float('inf'),
+                                 -float('inf'), 'x', '0.5', None, [0.5]])
+def test_read_settings_invalid_lifecycle_rate_raises_naming_the_parameter(bad):
+    with pytest.raises(bridge.ConfigError, match='rates.lifecycle'):
+        _settings_node(**{'rates.lifecycle': bad})._read_settings()
+
+
+def test_the_lifecycle_rate_limits_are_the_specified_ones():
+    assert (bridge.LIFECYCLE_MIN_RATE_HZ, bridge.LIFECYCLE_MAX_RATE_HZ) == (0.05, 0.5)
+    assert bridge.LIFECYCLE_MAX_NODES == 16
+
+
+def test_default_lifecycle_rate_and_nodes_in_parameters_are_valid():
+    defaults = dict(bridge.PARAMETERS)
+    assert defaults['rates.lifecycle'] == 0.5
+    node = _settings_node(**{'rates.lifecycle': defaults['rates.lifecycle'],
+                             'status.nodes': defaults['status.nodes']})
+    node._read_settings()
+    assert node._status_nodes[-5:] == tuple(defaults['status.nodes'])
+
+
+def test_read_settings_status_nodes_valid_list_is_kept_in_order():
+    node = _settings_node(mode='', **{'status.nodes': ['b', 'a', 'c_1', '_x', 'A9']})
+    node._read_settings()
+    assert node._status_nodes == ('b', 'a', 'c_1', '_x', 'A9')
+
+
+@pytest.mark.parametrize('nodes', [['a', 'a'], ['a', 'b', 'a'], ['x'] * 3])
+def test_read_settings_duplicate_status_nodes_raise(nodes):
+    with pytest.raises(bridge.ConfigError, match='status.nodes'):
+        _settings_node(**{'status.nodes': nodes})._read_settings()
+
+
+@pytest.mark.parametrize('name', ['', ' ', '1abc', 'a-b', 'a b', 'a/b', '/a', 'a.b', 'ñ', 'a\n',
+                                  'a;b', 'a' * 65, '../x', 'a$', '-x'])
+def test_read_settings_invalid_node_names_raise(name):
+    with pytest.raises(bridge.ConfigError, match='status.nodes'):
+        _settings_node(**{'status.nodes': ['ok', name]})._read_settings()
+
+
+@pytest.mark.parametrize('name', [1, 1.5, None, True, ['a'], {'a': 1}, b'abc'])
+def test_read_settings_non_string_node_names_raise(name):
+    with pytest.raises(bridge.ConfigError, match='status.nodes'):
+        _settings_node(**{'status.nodes': ['ok', name]})._read_settings()
+
+
+def test_read_settings_longest_valid_node_name_is_64_characters():
+    node = _settings_node(mode='', **{'status.nodes': ['a' * 64]})
+    node._read_settings()
+    assert node._status_nodes == ('a' * 64,)
+
+
+def test_read_settings_exactly_16_status_nodes_are_accepted_and_17_are_not():
+    names = [f'n{i}' for i in range(17)]
+    node = _settings_node(mode='', **{'status.nodes': names[:16]})
+    node._read_settings()
+    assert len(node._status_nodes) == 16
+    with pytest.raises(bridge.ConfigError, match='status.nodes'):
+        _settings_node(**{'status.nodes': names})._read_settings()
+
+
+@pytest.mark.parametrize('value', ['controller_server', None, 5, 1.5, True, {'a': 1},
+                                   {'a'}, b'abc'])
+def test_read_settings_status_nodes_that_is_not_a_list_raises(value):
+    with pytest.raises(bridge.ConfigError, match='status.nodes'):
+        _settings_node(**{'status.nodes': value})._read_settings()
+
+
+def test_read_settings_empty_status_nodes_keeps_only_the_mode_nodes():
+    node = _settings_node(mode='map', **{'status.nodes': []})
+    node._read_settings()
+    assert node._status_nodes == ('map_server', 'amcl')
+    node = _settings_node(mode='', **{'status.nodes': []})
+    node._read_settings()
+    assert node._status_nodes == ()
+
+
+def test_read_settings_a_tuple_of_node_names_is_accepted():
+    node = _settings_node(mode='', **{'status.nodes': ('a', 'b')})
+    node._read_settings()
+    assert node._status_nodes == ('a', 'b')
+
+
+@pytest.mark.parametrize('mode, expected', [
+    ('map', ('map_server', 'amcl', 'controller_server', 'planner_server')),
+    ('mapping', ('slam_toolbox', 'controller_server', 'planner_server')),
+    ('', ('controller_server', 'planner_server')),
+    ('nav', ('controller_server', 'planner_server'))])
+def test_read_settings_unites_the_localization_nodes_of_the_mode_with_the_configured(
+        mode, expected):
+    node = _settings_node(mode=mode, **{'status.nodes': ['controller_server',
+                                                         'planner_server']})
+    node._read_settings()
+    assert node._status_nodes == expected
+
+
+@pytest.mark.parametrize('mode, configured, expected', [
+    ('map', ['amcl', 'bt_navigator'], ('map_server', 'amcl', 'bt_navigator')),
+    ('map', ['map_server', 'amcl'], ('map_server', 'amcl')),
+    ('mapping', ['x', 'slam_toolbox'], ('slam_toolbox', 'x')),
+    ('mapping', ['amcl'], ('slam_toolbox', 'amcl')),       # configured explicitly: kept
+    ('map', ['slam_toolbox'], ('map_server', 'amcl', 'slam_toolbox'))])
+def test_read_settings_union_has_no_duplicates_and_puts_the_mode_nodes_first(
+        mode, configured, expected):
+    node = _settings_node(mode=mode, **{'status.nodes': configured})
+    node._read_settings()
+    assert node._status_nodes == expected
+    assert len(set(node._status_nodes)) == len(node._status_nodes)
+
+
+def test_the_mode_nodes_are_the_ones_the_launch_starts():
+    assert bridge.MODE_NODES == {'map': ('map_server', 'amcl'), 'mapping': ('slam_toolbox',)}
+
+
+def test_a_node_built_with_the_union_polls_the_mode_nodes_too():
+    node = _settings_node(mode='mapping', **{'status.nodes': ['planner_server']})
+    node._read_settings()
+    watched = make_lifecycle_node(node._status_nodes)
+    assert set(watched.created) == {'slam_toolbox/get_state', 'planner_server/get_state'}
+
+
+# map_dir
+
+def test_read_settings_map_dir_absolute_is_kept():
+    node = _settings_node(map_dir='/home/pi/maps')
+    node._read_settings()
+    assert node._map_dir == '/home/pi/maps'
+
+
+@pytest.mark.parametrize('raw, expected', [('/maps/', '/maps'), ('/a/./b', '/a/b'),
+                                           ('/a/b/../c', '/a/c'), ('  /maps  ', '/maps')])
+def test_read_settings_map_dir_is_normalised(raw, expected):
+    node = _settings_node(map_dir=raw)
+    node._read_settings()
+    assert node._map_dir == expected
+
+
+@pytest.mark.parametrize('raw', ['', '   ', '\t'])
+def test_read_settings_empty_map_dir_means_mtrb_maps_in_the_home_directory(
+        monkeypatch, raw):
+    monkeypatch.setenv('HOME', '/home/robot')
+    node = _settings_node(map_dir=raw)
+    node._read_settings()
+    assert node._map_dir == '/home/robot/mtrb_maps'
+    assert not node.logger.warning.called
+
+
+@pytest.mark.parametrize('raw', ['', '~/mtrb_maps'])
+def test_read_settings_without_a_resolvable_home_warns_and_keeps_an_unusable_map_dir(
+        monkeypatch, raw):
+    monkeypatch.delenv('HOME', raising=False)
+    monkeypatch.setattr(pwd, 'getpwuid', _no_such_user)
+    node = _settings_node(map_dir=raw)
+    node._read_settings()                     # the node still starts
+    assert node.logger.warning.called
+    assert node._map_dir.startswith('~')      # not absolute: every save answers 500
+    assert 'home' in str(node.logger.warning.call_args).lower()
+
+
+def _no_such_user(uid):
+    raise KeyError(uid)
+
+
+def test_read_settings_map_dir_expands_the_home_directory(monkeypatch):
+    monkeypatch.setenv('HOME', '/home/robot')
+    node = _settings_node(map_dir='~/mtrb_maps')
+    node._read_settings()
+    assert node._map_dir == '/home/robot/mtrb_maps'
+
+
+def test_read_settings_unknown_user_map_dir_starts_with_a_warning_and_is_unusable():
+    node = _settings_node(map_dir='~nosuchuser_zzz/maps')
+    node._read_settings()
+    assert node.logger.warning.called
+    assert node._map_dir == '~nosuchuser_zzz/maps'
+    assert not os.path.isabs(node._map_dir)
+
+
+@pytest.mark.parametrize('raw', ['maps', './maps', '../maps', 'a/b'])
+def test_read_settings_relative_map_dir_raises(raw):
+    with pytest.raises(bridge.ConfigError, match='map_dir'):
+        _settings_node(map_dir=raw)._read_settings()
+
+
+@pytest.mark.parametrize('raw', [None, 5, 1.5, True, False, ['/maps'], {'a': 1}, b'/maps'])
+def test_read_settings_non_string_map_dir_raises(raw):
+    with pytest.raises(bridge.ConfigError, match='map_dir'):
+        _settings_node(map_dir=raw)._read_settings()
+
+
+# shipped parameter files
+
+def _shipped_params(file_name):
+    import os
+    import yaml
+    path = os.path.join(os.path.dirname(__file__), '..', 'param', file_name)
+    with open(path, encoding='utf-8') as handle:
+        return yaml.safe_load(handle)['mtrb_web_bridge']['ros__parameters']
+
+
+def _flat(tree, prefix=''):
+    flat = {}
+    for key, value in tree.items():
+        if isinstance(value, dict):
+            flat.update(_flat(value, f'{prefix}{key}.'))
+        else:
+            flat[f'{prefix}{key}'] = value
+    return flat
+
+
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_the_shipped_files_pass_read_settings_in_both_modes(file_name, share):
+    flat = _flat(_shipped_params(file_name))
+    for mode in ('map', 'mapping'):
+        values = {k: v for k, v in flat.items() if k in VALID_SETTINGS}
+        node = _settings_node(**{**values, 'mode': mode})
+        node._read_settings()                       # raises ConfigError if invalid
+        assert node._lifecycle_period_s == pytest.approx(1.0 / flat['rates.lifecycle'])
+        assert set(flat['status.nodes']) <= set(node._status_nodes)
+
+
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_every_key_of_the_shipped_files_is_a_declared_node_parameter(file_name):
+    declared = {name for name, _ in bridge.PARAMETERS}
+    assert set(_flat(_shipped_params(file_name))) <= declared
+
+
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_the_node_defaults_of_the_phase_5_parameters_match_the_shipped_files(file_name):
+    flat = _flat(_shipped_params(file_name))
+    defaults = dict(bridge.PARAMETERS)
+    for key in ('rates.lifecycle', 'status.nodes', 'map_dir'):
+        assert defaults[key] == flat[key], key
+
+
+# =========================================================================================
+# Security fixes of phase 5: token strength, allow_example_token, map quotas, ~/mtrb_maps.
+# The tests fix the SAFE behaviour: the node refuses to start with a weak token unless the
+# development switch is a real bool AND the host is loopback; the token is never printed.
+# =========================================================================================
+
+SENTINEL_TOKEN = 'SENTINEL-tok-7f3a9c1e'          # 21 characters: strong, unique, greppable
+PLACEHOLDER = 'CHANGE-ME-example-token'           # the value shipped in the repository
+LOOPBACK = ['127.0.0.1', '::1', 'localhost']
+NOT_LOOPBACK = ['0.0.0.0', '::', '192.168.1.50', '10.0.0.5', '172.16.3.4', 'fe80::1',
+                'robot.local', 'localhost.evil.com', '127.0.0.1.evil.com', '127.0.0.2']
+
+
+def _everything_printed(logger, caplog=None):
+    text = ' '.join(str(c) for c in logger.method_calls)
+    return text + (caplog.text if caplog is not None else '')
+
+
+def _refused(params, **kwargs):
+    """Run __init__ expecting ConfigError; return the exception text."""
+    with pytest.raises(bridge.ConfigError) as caught:
+        _init_node(params, **kwargs)
+    return str(caught.value)
+
+
+def test_token_constants_are_the_documented_ones():
+    assert bridge.TOKEN_MIN_LENGTH == 16
+    assert tuple(bridge.LOOPBACK_HOSTS) == ('127.0.0.1', '::1', 'localhost')
+    assert dict(bridge.PARAMETERS)['auth.allow_example_token'] is False
+
+
+@pytest.mark.parametrize('host', ['127.0.0.1', '0.0.0.0', '192.168.1.50'])
+def test_the_example_token_is_refused_by_default_on_every_host(host):
+    text = _refused({'auth.token': PLACEHOLDER, 'host': host})
+    assert PLACEHOLDER not in text
+
+
+@pytest.mark.parametrize('token', ['CHANGE-ME', 'CHANGE-ME-', 'CHANGE-ME-' + 'x' * 40])
+def test_any_token_with_the_placeholder_prefix_is_refused_even_if_long(token):
+    assert token not in _refused({'auth.token': token})
+
+
+def test_a_15_character_token_is_refused():
+    token = 'a1B2c3D4e5F6g7H'
+    assert len(token) == 15
+    assert token not in _refused({'auth.token': token})
+
+
+@pytest.mark.parametrize('length', [16, 17, 32, 64])
+def test_a_token_of_16_or_more_characters_starts_without_a_warning(length):
+    token = 'k9' * (length // 2) + 'z' * (length % 2)
+    assert len(token) == length
+    node, logger = _init_node({'auth.token': token})
+    assert node.host == '127.0.0.1'
+    assert not logger.warning.called and not logger.error.called
+
+
+@pytest.mark.parametrize('token', ['', '1', 'short', 'x' * 8, '123456'])
+def test_short_tokens_are_refused_by_default(token):
+    assert 'token' in _refused({'auth.token': token}, token_result=token).lower()
+
+
+def test_the_length_is_measured_after_stripping_the_parameter_whitespace():
+    token = ' ' + 'a' * 14 + ' '        # 16 characters with spaces, 14 once stripped
+    assert len(token) == 16
+    _refused({'auth.token': token})
+
+
+@pytest.mark.parametrize('token', [PLACEHOLDER, 'short-tok', '123456'])
+@pytest.mark.parametrize('host', LOOPBACK)
+def test_allow_example_token_true_on_loopback_starts_with_a_warning(token, host):
+    node, logger = _init_node({'auth.token': token, 'host': host,
+                               'auth.allow_example_token': True})
+    assert node.host == host
+    assert logger.warning.called
+    assert token not in _everything_printed(logger)
+    assert 'DEVELOPMENT' in str(logger.warning.call_args)
+
+
+@pytest.mark.parametrize('host', NOT_LOOPBACK)
+@pytest.mark.parametrize('token', [PLACEHOLDER, 'short-tok'])
+def test_allow_example_token_true_is_not_honoured_on_a_non_loopback_host(host, token):
+    text = _refused({'auth.token': token, 'host': host, 'auth.allow_example_token': True})
+    assert token not in text
+
+
+@pytest.mark.parametrize('allow', ['true', 'True', 'yes', 1, 1.0, 0, None, [], 'false'])
+@pytest.mark.parametrize('host', ['127.0.0.1', '0.0.0.0'])
+def test_allow_example_token_must_be_a_real_bool(allow, host):
+    text = _refused({'auth.token': PLACEHOLDER, 'host': host,
+                     'auth.allow_example_token': allow})
+    assert PLACEHOLDER not in text
+
+
+def test_allow_example_token_false_is_the_default_and_refuses_the_placeholder_on_loopback():
+    assert dict(bridge.PARAMETERS)['auth.allow_example_token'] is False
+    _refused({'auth.token': PLACEHOLDER, 'host': '127.0.0.1',
+              'auth.allow_example_token': False})
+
+
+def test_a_strong_token_ignores_allow_example_token_and_logs_no_warning():
+    node, logger = _init_node({'auth.token': SENTINEL_TOKEN, 'host': '0.0.0.0',
+                               'auth.allow_example_token': True})
+    assert node.host == '0.0.0.0'
+    assert not logger.warning.called
+
+
+@pytest.mark.parametrize('token', [SENTINEL_TOKEN, 'CHANGE-ME-' + SENTINEL_TOKEN,
+                                   'S-' + SENTINEL_TOKEN[:12]])
+def test_the_token_never_appears_in_logs_or_in_exception_messages(token, caplog):
+    with caplog.at_level(logging.DEBUG):
+        try:
+            node, logger = _init_node({'auth.token': token})
+        except bridge.ConfigError as err:
+            assert token not in str(err) and token not in repr(err)
+            assert token not in ''.join(str(a) for a in err.args)
+        else:
+            assert token not in _everything_printed(logger, caplog)
+    assert token not in caplog.text
+
+
+@pytest.mark.parametrize('host', ['0.0.0.0', '192.168.1.50'])
+def test_refused_startup_does_not_print_the_token_in_the_error_for_any_host(host, caplog):
+    with caplog.at_level(logging.DEBUG):
+        text = _refused({'auth.token': 'CHANGE-ME-' + SENTINEL_TOKEN, 'host': host,
+                         'auth.allow_example_token': True})
+    assert SENTINEL_TOKEN not in text and SENTINEL_TOKEN not in caplog.text
+
+
+def test_a_refused_token_never_builds_the_web_app():
+    created = []
+    with mock.patch.object(bridge, 'create_app', side_effect=created.append):
+        with pytest.raises(bridge.ConfigError):
+            _init_node({'auth.token': PLACEHOLDER})
+    assert created == []
+
+
+@pytest.mark.parametrize('env_token', ['xyz', 'a' * 15, PLACEHOLDER])
+def test_a_weak_token_in_the_environment_is_refused(monkeypatch, env_token):
+    monkeypatch.setenv(TOKEN_ENV_VAR, env_token)
+    text = _refused({'auth.token': 'p' * 32})     # the environment has priority: still weak
+    assert env_token not in text
+
+
+def test_a_short_environment_token_is_a_config_error_not_a_silent_fallback(monkeypatch):
+    monkeypatch.setenv(TOKEN_ENV_VAR, 'a' * 15)
+    _refused({'auth.token': ''}, token_result=SENTINEL_TOKEN)
+
+
+def test_a_16_character_environment_token_starts(monkeypatch):
+    monkeypatch.setenv(TOKEN_ENV_VAR, 'e' * 16)
+    node, logger = _init_node({'auth.token': ''}, token_result='')
+    assert not logger.warning.called
+
+
+def test_a_weak_environment_token_with_allow_and_loopback_starts_with_a_warning(monkeypatch):
+    monkeypatch.setenv(TOKEN_ENV_VAR, 'dev')
+    node, logger = _init_node({'auth.token': '', 'auth.allow_example_token': True},
+                              token_result='')
+    assert logger.warning.called and 'dev' not in _everything_printed(logger)
+
+
+def test_a_weak_token_from_the_param_files_is_refused():
+    _refused({'auth.token': ''}, token_result=PLACEHOLDER)
+    _refused({'auth.token': ''}, token_result='abc')
+
+
+# --- maps.min_free_mb / maps.min_interval_s -----------------------------------------------
+
+def test_the_quota_parameters_have_the_documented_defaults():
+    defaults = dict(bridge.PARAMETERS)
+    assert defaults['maps.min_free_mb'] == 200
+    assert defaults['maps.min_interval_s'] == 5.0
+
+
+def test_read_settings_reads_the_quota_parameters():
+    node = _settings_node(**{'maps.min_free_mb': 350, 'maps.min_interval_s': 12})
+    node._read_settings()
+    assert node._map_min_free_mb == 350
+    assert node._map_min_interval_s == 12.0 and isinstance(node._map_min_interval_s, float)
+
+
+@pytest.mark.parametrize('value', [0, 1, 200, 10 ** 6, 0.5])
+def test_read_settings_accepts_valid_min_free_mb(value):
+    node = _settings_node(**{'maps.min_free_mb': value})
+    node._read_settings()
+    assert node._map_min_free_mb == value
+
+
+@pytest.mark.parametrize('bad', [-1, -0.1, True, False, 'x', '200', None, float('nan'),
+                                 float('inf'), [], {}])
+def test_read_settings_invalid_min_free_mb_raises(bad):
+    with pytest.raises(bridge.ConfigError, match='maps.min_free_mb'):
+        _settings_node(**{'maps.min_free_mb': bad})._read_settings()
+
+
+@pytest.mark.parametrize('value', [0, 0.0, 0.5, 5, 3600])
+def test_read_settings_accepts_valid_min_interval_s(value):
+    node = _settings_node(**{'maps.min_interval_s': value})
+    node._read_settings()
+    assert node._map_min_interval_s == float(value)
+
+
+@pytest.mark.parametrize('bad', [-1, -0.1, True, False, 'x', '5', None, float('nan'),
+                                 float('inf'), []])
+def test_read_settings_invalid_min_interval_s_raises(bad):
+    with pytest.raises(bridge.ConfigError, match='maps.min_interval_s'):
+        _settings_node(**{'maps.min_interval_s': bad})._read_settings()
+
+
+def test_init_hands_the_map_quotas_and_the_map_dir_to_the_web_app():
+    node, _ = _init_node({'auth.token': SENTINEL_TOKEN})
+    [call] = node.create_app_mock.call_args_list
+    assert call.kwargs['map_dir'] == '/share/map'
+    assert call.kwargs['map_min_free_mb'] == 200
+    assert call.kwargs['map_min_interval_s'] == 5.0
+    assert call.kwargs['map_port'] is node and call.kwargs['on_event'] == node._log_map_event
+
+
+# --- ~/mtrb_maps end to end (node settings + real MapSaver on a temporary HOME) -----------
+
+class _WritingPort:
+    """MapPort double that writes a tiny map."""
+
+    def __init__(self):
+        self.saves = []
+
+    def ready(self):
+        return True
+
+    def save_map(self, base_path, timeout_s):
+        self.saves.append(base_path)
+        for ext in ('.yaml', '.pgm'):
+            with open(base_path + ext, 'wb') as handle:
+                handle.write(b'x')
+        return True
+
+    def serialize_posegraph(self, base_path, timeout_s):
+        return False
+
+
+def _client_for(node, port):
+    from fastapi.testclient import TestClient
+    from mtrb_bringup.web_server import create_app
+    store = StateStore()
+    store.update(mode='mapping')
+    app = create_app(store, SENTINEL_TOKEN, map_port=port, map_dir=node._map_dir,
+                     map_min_free_mb=0, map_min_interval_s=0.0)
+    return TestClient(app)
+
+
+AUTH_HEADERS = {'Authorization': f'Bearer {SENTINEL_TOKEN}'}
+
+
+def test_the_first_save_with_an_empty_map_dir_creates_home_mtrb_maps_with_mode_0755(
+        tmp_path, monkeypatch):
+    home = os.path.join(os.path.realpath(str(tmp_path)), 'home')
+    os.mkdir(home)
+    monkeypatch.setenv('HOME', home)
+    node = _settings_node(map_dir='')
+    node._read_settings()
+    assert node._map_dir == os.path.join(home, 'mtrb_maps')
+    assert not os.path.exists(node._map_dir)          # created lazily, at the first save
+    previous = os.umask(0o022)
+    try:
+        port = _WritingPort()
+        response = _client_for(node, port).post('/api/map/save', json={'name': 'lab'},
+                                                headers=AUTH_HEADERS)
+    finally:
+        os.umask(previous)
+    assert response.status_code == 200, response.text
+    assert (os.stat(node._map_dir).st_mode & 0o777) == 0o755
+    assert port.saves == [os.path.join(node._map_dir, 'lab')]
+    assert os.path.isfile(os.path.join(node._map_dir, 'lab.yaml'))
+
+
+def test_without_a_home_the_save_answers_500_map_dir_invalid_and_creates_nothing(
+        tmp_path, monkeypatch):
+    monkeypatch.delenv('HOME', raising=False)
+    monkeypatch.setattr(pwd, 'getpwuid', _no_such_user)
+    monkeypatch.chdir(tmp_path)
+    node = _settings_node(map_dir='')
+    node._read_settings()
+    assert node.logger.warning.called                 # warned at startup
+    port = _WritingPort()
+    client = _client_for(node, port)
+    response = client.post('/api/map/save', json={'name': 'lab'}, headers=AUTH_HEADERS)
+    assert (response.status_code, response.json()['error']) == (500, 'map_dir_invalid')
+    assert port.saves == []
+    assert os.listdir(str(tmp_path)) == []            # no literal '~' directory in the cwd
+    assert str(tmp_path) not in response.text and '~' not in response.text
+
+
+def test_a_symlink_among_the_files_of_the_default_map_dir_is_rejected(tmp_path, monkeypatch):
+    home = os.path.join(os.path.realpath(str(tmp_path)), 'home')
+    maps = os.path.join(home, 'mtrb_maps')
+    os.makedirs(maps)
+    victim = os.path.join(home, 'victim')
+    with open(victim, 'wb') as handle:
+        handle.write(b'do-not-touch')
+    os.symlink(victim, os.path.join(maps, 'lab.yaml'))
+    monkeypatch.setenv('HOME', home)
+    node = _settings_node(map_dir='')
+    node._read_settings()
+    port = _WritingPort()
+    response = _client_for(node, port).post(
+        '/api/map/save', json={'name': 'lab', 'overwrite': True}, headers=AUTH_HEADERS)
+    assert (response.status_code, response.json()['error']) == (500, 'map_dir_invalid')
+    assert port.saves == []
+    with open(victim, 'rb') as handle:
+        assert handle.read() == b'do-not-touch'
+
+
+# --- the files shipped in param/ ----------------------------------------------------------
+
+def _shipped_init_values(file_name):
+    return dict(_flat(_shipped_params(file_name)))
+
+
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_the_repository_ships_the_example_token_and_the_node_refuses_to_start_with_it(
+        file_name):
+    values = _shipped_init_values(file_name)
+    assert values['auth.token'] == PLACEHOLDER        # the repo really ships the placeholder
+    assert values['auth.allow_example_token'] is False
+    assert _refused(values) is not None               # host 0.0.0.0 + placeholder
+
+
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_the_shipped_values_start_with_a_real_token(file_name):
+    values = _shipped_init_values(file_name)
+    values['auth.token'] = SENTINEL_TOKEN
+    node, logger = _init_node(values)
+    assert node.host == values['host']
+    assert not logger.warning.called
+
+
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_the_shipped_values_with_allow_example_token_need_a_loopback_host(file_name):
+    values = _shipped_init_values(file_name)
+    values['auth.allow_example_token'] = True
+    _refused(values)                                  # shipped host is 0.0.0.0
+    values['host'] = '127.0.0.1'
+    node, logger = _init_node(values)
+    assert logger.warning.called and PLACEHOLDER not in _everything_printed(logger)
+
+
+def test_the_two_shipped_files_have_exactly_the_same_keys_and_security_values():
+    web, example = _flat(_shipped_params('web.yaml')), _flat(_shipped_params('web.example.yaml'))
+    assert set(web) == set(example)
+    for key in ('auth.allow_example_token', 'auth.token', 'map_dir', 'maps.min_free_mb',
+                'maps.min_interval_s', 'host'):
+        assert web[key] == example[key], key
+
+
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_the_shipped_files_declare_exactly_the_node_parameters_but_the_launch_injected(
+        file_name):
+    declared = {name for name, _ in bridge.PARAMETERS}
+    assert set(_flat(_shipped_params(file_name))) == declared - {'mode'}
+
+
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_the_shipped_security_values_equal_the_node_defaults(file_name):
+    flat = _flat(_shipped_params(file_name))
+    defaults = dict(bridge.PARAMETERS)
+    for key in ('auth.allow_example_token', 'maps.min_free_mb', 'maps.min_interval_s',
+                'map_dir'):
+        assert flat[key] == defaults[key], key
+    assert flat['maps.min_free_mb'] == 200 and flat['maps.min_interval_s'] == 5.0
+
+
+# =========================================================================================
+# Parameter declaration (phase 5, security/startup). Until now _init_node replaced
+# declare_parameter by a no-op, so the declaration path had no coverage. The fake below
+# imitates rclpy Jazzy (Node.declare_parameters / _set_parameters_atomically_common): the
+# declared type is inferred from the default; an override of another type raises
+# InvalidParameterTypeException unless the descriptor has dynamic_typing=True.
+# =========================================================================================
+
+import copy  # noqa: E402, I100
+
+
+class RealisticDescriptor:
+    """Same public attribute as rcl_interfaces/msg/ParameterDescriptor."""
+
+    def __init__(self, dynamic_typing=False, **_ignored):
+        self.dynamic_typing = dynamic_typing
+
+
+def _rclpy_type(value):
+    """Return the Parameter.Type name rclpy infers from a Python value."""
+    if isinstance(value, bool):
+        return 'bool'
+    if isinstance(value, int):
+        return 'integer'
+    if isinstance(value, float):
+        return 'double'
+    if isinstance(value, str):
+        return 'string'
+    if isinstance(value, (list, tuple)):
+        if all(isinstance(v, str) for v in value) and value:
+            return 'string_array'
+        return 'byte_array' if not value else 'other_array'
+    return 'other'
+
+
+class RealisticParameters:
+    """Declared-parameter store with the type rules of rclpy (overrides = YAML values)."""
+
+    def __init__(self, overrides):
+        self.overrides = dict(overrides)
+        self.values = {}
+        self.declared = []           # (name, dynamic_typing)
+
+    def declare_parameter(self, name, value=None, descriptor=None, ignore_override=False):
+        assert name not in self.values, f'{name} declared twice'
+        dynamic = descriptor is not None and descriptor.dynamic_typing is True
+        actual = self.overrides[name] if name in self.overrides else value
+        if not dynamic and _rclpy_type(actual) != _rclpy_type(value):
+            # The real exception text embeds the offending value: the node must not repeat it.
+            raise bridge.InvalidParameterTypeException(
+                f'{name}={actual!r}', _rclpy_type(value))
+        self.values[name] = actual
+        self.declared.append((name, dynamic))
+
+    def get_parameter(self, name):
+        return FakeParam(self.values[name])
+
+
+STRONG_TOKEN = 'declared-tok-0123456789'
+
+
+def _init_declared(overrides, token=STRONG_TOKEN, host=None, space_cls=None):
+    """Run the REAL __init__ (declaration, validation, teleop) with the realistic fake."""
+    overrides = dict(overrides)
+    if host is not None:
+        overrides['host'] = host
+    space = (space_cls or RealisticParameters)(overrides)
+    logger = mock.Mock()
+    create_app_mock = mock.Mock(return_value=object())
+    with mock.patch.object(bridge.Node, '__init__', lambda self, name: None), \
+            mock.patch.object(bridge, 'ParameterDescriptor', RealisticDescriptor), \
+            mock.patch.object(bridge.MtrbWebBridge, 'declare_parameter', create=True,
+                              new=lambda self, *a, **k: space.declare_parameter(*a, **k)), \
+            mock.patch.object(bridge.MtrbWebBridge, 'get_parameter', create=True,
+                              new=lambda self, n: space.get_parameter(n)), \
+            mock.patch.object(bridge.MtrbWebBridge, 'get_logger', create=True,
+                              new=lambda self: logger), \
+            mock.patch.object(bridge, 'get_package_share_directory', return_value='/share'), \
+            mock.patch.object(bridge, 'resolve_token', return_value=token), \
+            mock.patch.object(bridge.MtrbWebBridge, '_init_ros_io', new=lambda self: None), \
+            mock.patch.object(bridge, 'create_app', new=create_app_mock):
+        node = bridge.MtrbWebBridge()
+    node.create_app_mock = create_app_mock
+    node.space = space
+    node.logger_double = logger
+    return node
+
+
+def _declared_refusal(overrides, **kwargs):
+    with pytest.raises(bridge.ConfigError) as caught:
+        _init_declared(overrides, **kwargs)
+    return str(caught.value)
+
+
+EXPECTED_DYNAMIC = {
+    'auth.token', 'rates.pose', 'rates.scan', 'rates.status', 'rates.lifecycle',
+    'teleop.max_vx', 'teleop.max_wz', 'scan.min_range', 'scan.max_range',
+    'dock.x', 'dock.y', 'dock.yaw', 'maps.min_free_mb', 'maps.min_interval_s',
+    'status.nodes'}
+# Integer or bool or str BY DESIGN: _number(integer=True) / strict bool / text. A float here is
+# a configuration error, so they keep static typing on purpose.
+STATIC_BY_DESIGN = {
+    'port', 'teleop.timeout_ms', 'teleop.enabled', 'scan.max_points', 'plan.max_points',
+    'limits.max_clients', 'limits.max_ws_bytes', 'auth.allow_example_token'}
+
+
+def test_dynamic_parameters_are_exactly_the_fifteen_expected():
+    assert set(bridge.DYNAMIC_PARAMETERS) == EXPECTED_DYNAMIC
+    assert len(bridge.DYNAMIC_PARAMETERS) == 15
+
+
+def test_every_dynamic_parameter_is_declared_in_parameters():
+    assert set(bridge.DYNAMIC_PARAMETERS) <= {name for name, _ in bridge.PARAMETERS}
+
+
+def test_every_numeric_default_is_dynamic_or_int_bool_by_design():
+    """Guards against a new float/number parameter that rclpy would reject for `10` vs `10.0`."""
+    unclassified = []
+    for name, default in bridge.PARAMETERS:
+        numeric = isinstance(default, (int, float)) and not isinstance(default, bool)
+        if numeric and name not in bridge.DYNAMIC_PARAMETERS and name not in STATIC_BY_DESIGN:
+            unclassified.append(name)
+    assert unclassified == []
+
+
+def test_float_defaults_are_always_dynamic():
+    floats = [n for n, d in bridge.PARAMETERS if isinstance(d, float)]
+    assert floats and all(n in bridge.DYNAMIC_PARAMETERS for n in floats)
+
+
+def test_the_node_declares_dynamic_parameters_with_dynamic_typing_and_the_rest_without():
+    node = _init_declared({})
+    flags = dict(node.space.declared)
+    assert set(flags) == {name for name, _ in bridge.PARAMETERS}
+    assert {n for n, dynamic in flags.items() if dynamic} == EXPECTED_DYNAMIC
+
+
+def test_the_realistic_fake_rejects_a_type_change_of_a_static_parameter():
+    space = RealisticParameters({'port': 8080.0})
+    with pytest.raises(bridge.InvalidParameterTypeException):
+        space.declare_parameter('port', 8080, RealisticDescriptor())
+    space.declare_parameter('port', 8080, RealisticDescriptor(dynamic_typing=True))
+    assert space.get_parameter('port').value == 8080.0
+
+
+def test_defaults_alone_start_through_the_real_declaration_path():
+    node = _init_declared({})
+    assert node.port == 8080 and node._map_min_interval_s == 5.0
+
+
+@pytest.mark.parametrize('overrides,check', [
+    ({'maps.min_interval_s': 0}, lambda n: (n._map_min_interval_s == 0.0
+                                            and isinstance(n._map_min_interval_s, float))),
+    ({'maps.min_interval_s': 0.0}, lambda n: n._map_min_interval_s == 0.0),
+    ({'maps.min_free_mb': 0}, lambda n: n._map_min_free_mb == 0),
+    ({'maps.min_free_mb': 150.5}, lambda n: n._map_min_free_mb == 150.5),
+    ({'maps.min_free_mb': 150}, lambda n: n._map_min_free_mb == 150),
+    ({'rates.pose': 10}, lambda n: n._pose_period_s == pytest.approx(0.1)),
+    ({'rates.scan': 5}, lambda n: n._scan_period_s == pytest.approx(0.2)),
+    ({'rates.status': 2}, lambda n: n._status_period_s == pytest.approx(0.5)),
+    ({'rates.lifecycle': 0.25}, lambda n: n._lifecycle_period_s == pytest.approx(4.0)),
+    ({'teleop.max_wz': 1}, lambda n: n._teleop_gate is not None),
+    ({'dock.x': 1}, lambda n: n._dock == (1.0, 0.0, 0.0)),
+    ({'dock.y': 2, 'dock.yaw': -3}, lambda n: n._dock == (0.0, 2.0, -3.0)),
+    ({'scan.min_range': 0, 'scan.max_range': 12}, lambda n: n._scan_max_range_m == 12),
+])
+def test_integer_or_float_yaml_values_of_dynamic_parameters_start(overrides, check):
+    node = _init_declared(overrides)
+    assert check(node)
+
+
+def test_max_quota_values_reach_create_app_as_declared():
+    node = _init_declared({'maps.min_free_mb': 150.5, 'maps.min_interval_s': 0})
+    kwargs = node.create_app_mock.call_args.kwargs
+    assert kwargs['map_min_free_mb'] == 150.5 and kwargs['map_min_interval_s'] == 0.0
+
+
+def test_teleop_max_vx_as_an_integer_is_declared_but_rejected_by_the_hard_ceiling():
+    # `teleop.max_vx: 1` is an int (declaration OK, dynamic) but 1 m/s > 0.46 m/s (Create 3).
+    text = _declared_refusal({'teleop.max_vx': 1})
+    assert 'teleop.max_vx' in text and 'wrong type' not in text and '0.46' in text
+
+
+@pytest.mark.parametrize('name,value', [
+    ('port', 8080.0), ('port', 48123.75), ('teleop.timeout_ms', 300.0),
+    ('teleop.timeout_ms', 612.75), ('teleop.enabled', 'yes'),
+    ('teleop.enabled', 'SENTINEL-yes'), ('auth.allow_example_token', 'true'),
+    ('auth.allow_example_token', 'SENTINEL-true'), ('host', 1), ('host', 7654321),
+    ('map_dir', 3), ('map_dir', 7654321), ('scan.max_points', 360.5),
+    ('plan.max_points', '200'), ('limits.max_clients', 5.5), ('limits.max_ws_bytes', None),
+    ('mode', 1), ('teleop.enabled', 1), ('port', True),
+])
+def test_wrong_type_of_a_static_parameter_is_a_config_error_naming_it_without_the_value(
+        name, value):
+    text = _declared_refusal({name: value})
+    assert text.startswith(f'Invalid parameter {name}: wrong type or value (')
+    assert 'InvalidParameterTypeException' in text
+    assert repr(value) not in text
+    if not isinstance(value, (bool, int, type(None))):
+        assert str(value) not in text
+    elif isinstance(value, int) and not isinstance(value, bool):
+        assert str(value) not in text.replace(name, '')
+
+
+@pytest.mark.parametrize('exc', [bridge.InvalidParameterTypeException('p', 't'),
+                                 bridge.InvalidParameterValueException('p', 'LEAK-v', 'r'),
+                                 TypeError('LEAK-v'), ValueError('LEAK-v')])
+def test_every_declaration_error_class_becomes_a_config_error_without_its_text(exc):
+    class Raising(RealisticParameters):
+        def declare_parameter(self, name, value=None, descriptor=None, ignore_override=False):
+            raise exc
+
+    text = _declared_refusal({}, space_cls=Raising)
+    assert text.startswith('Invalid parameter host: wrong type or value (')
+    assert type(exc).__name__ in text and 'LEAK-v' not in text
+
+
+def test_a_declaration_error_stops_the_startup_before_the_token_and_the_app():
+    node_text = _declared_refusal({'port': 1.5})
+    assert 'port' in node_text
+
+
+def test_a_declaration_error_never_builds_the_app():
+    created = []
+    with mock.patch.object(bridge, 'create_app', side_effect=created.append):
+        with pytest.raises(bridge.ConfigError):
+            _init_declared({'host': 1})
+    assert created == []
+
+
+MAPS_BAD = [True, float('nan'), float('inf'), -float('inf'), -1, 'x']
+NUMERIC_CASES = (
+    [(name, bad) for name in ('maps.min_free_mb', 'maps.min_interval_s') for bad in MAPS_BAD]
+    + [(name, bad) for name in ('rates.pose', 'rates.scan', 'rates.status', 'rates.lifecycle')
+       for bad in MAPS_BAD + [0]]
+    # dock.*: -1 is a legal coordinate; only non-numbers, non finite and out of range fail.
+    + [(name, bad) for name in ('dock.x', 'dock.y', 'dock.yaw')
+       for bad in [True, float('nan'), float('inf'), -float('inf'), 'x']]
+    + [(name, bad) for name in ('teleop.max_vx', 'teleop.max_wz')
+       for bad in MAPS_BAD + [0, 100]]
+    + [(name, bad) for name in ('scan.min_range', 'scan.max_range') for bad in MAPS_BAD]
+)
+
+
+@pytest.mark.parametrize('name,bad', NUMERIC_CASES)
+def test_invalid_numeric_values_of_dynamic_parameters_are_a_config_error_naming_it(name, bad):
+    text = _declared_refusal({name: bad})
+    assert f'Invalid parameter {name}' in text
+
+
+@pytest.mark.parametrize('name', ['dock.x', 'dock.y', 'dock.yaw'])
+@pytest.mark.parametrize('bad', [1e5, -1e5])
+def test_a_dock_pose_beyond_the_sanity_bound_is_a_config_error(name, bad):
+    text = _declared_refusal({name: bad})
+    assert 'dock.x/y/yaw' in text or f'Invalid parameter {name}' in text
+
+
+def test_a_zero_minimum_interval_and_zero_free_space_are_valid():
+    node = _init_declared({'maps.min_interval_s': 0, 'maps.min_free_mb': 0})
+    assert (node._map_min_free_mb, node._map_min_interval_s) == (0, 0.0)
+
+
+def test_negative_dock_coordinates_are_valid():
+    assert _init_declared({'dock.x': -1, 'dock.y': -1.5})._dock == (-1.0, -1.5, 0.0)
+
+
+def test_scan_min_range_must_stay_below_max_range():
+    assert 'scan' in _declared_refusal({'scan.min_range': 5, 'scan.max_range': 5})
+
+
+def test_an_empty_status_nodes_list_is_accepted_and_only_the_mode_nodes_remain():
+    node = _init_declared({'status.nodes': [], 'mode': 'map'})
+    assert node._status_nodes == ('map_server', 'amcl')
+    assert _init_declared({'status.nodes': []})._status_nodes == ()
+
+
+def test_a_valid_status_nodes_list_is_kept_in_order():
+    node = _init_declared({'status.nodes': ['planner_server', 'bt_navigator']})
+    assert node._status_nodes == ('planner_server', 'bt_navigator')
+
+
+@pytest.mark.parametrize('nodes', ['controller_server', 5, ['bad name'], ['a', 'a'],
+                                   ['n%d' % i for i in range(17)], [1, 2]])
+def test_an_invalid_status_nodes_value_is_a_config_error(nodes):
+    assert 'status.nodes' in _declared_refusal({'status.nodes': nodes})
+
+
+# --- auth.allow_example_token is validated as a bool whatever the token strength -----------
+
+NOT_BOOL = ['true', 'True', 'yes', 1, 0, 1.0, None, [], 'false']
+
+
+@pytest.mark.parametrize('allow', NOT_BOOL)
+@pytest.mark.parametrize('token', [STRONG_TOKEN, 'weak', PLACEHOLDER, 'change-me-' + 'x' * 16])
+@pytest.mark.parametrize('host', ['127.0.0.1', '0.0.0.0'])
+def test_check_token_strength_requires_a_real_bool_even_with_a_strong_token(
+        allow, token, host):
+    node = make_node({'auth.allow_example_token': allow})
+    node.host = host
+    with pytest.raises(bridge.ConfigError) as caught:
+        node._check_token_strength(token)
+    assert 'auth.allow_example_token' in str(caught.value)
+    assert token not in str(caught.value)
+    assert not node.logger.warning.called
+
+
+@pytest.mark.parametrize('token', [STRONG_TOKEN, 'weak'])
+@pytest.mark.parametrize('allow', ['true', 'SENTINEL-true', 1])
+def test_a_non_bool_allow_example_token_is_a_config_error_through_the_real_declaration(
+        token, allow):
+    text = _declared_refusal({'auth.allow_example_token': allow}, token=token)
+    assert 'auth.allow_example_token' in text and token not in text
+    assert repr(allow) not in text
+
+
+@pytest.mark.parametrize('allow', [True, False])
+def test_a_bool_allow_example_token_with_a_strong_token_starts_without_a_warning(allow):
+    node = _init_declared({'auth.allow_example_token': allow}, host='0.0.0.0')
+    assert not node.logger_double.warning.called
+
+
+# --- placeholder detection in the node ------------------------------------------------------
+
+LOWER_PLACEHOLDER = 'change-me-' + 'x' * 16
+
+
+@pytest.mark.parametrize('host', LOOPBACK + NOT_LOOPBACK)
+def test_a_lowercase_placeholder_token_of_16_plus_chars_is_refused_without_override(host):
+    assert len(LOWER_PLACEHOLDER) >= 16
+    text = _refused({'auth.token': LOWER_PLACEHOLDER, 'host': host})
+    assert LOWER_PLACEHOLDER not in text
+
+
+@pytest.mark.parametrize('token', ['Change-Me-' + 'y' * 16, '  change-me-' + 'z' * 20,
+                                   'cHaNgE-mE-' + 'q' * 16])
+def test_mixed_case_placeholder_tokens_are_refused_through_the_real_declaration(token):
+    text = _declared_refusal({'auth.token': token}, token=token, host='127.0.0.1')
+    assert token.strip() not in text
+
+
+def test_a_lowercase_placeholder_is_accepted_only_with_the_override_on_loopback():
+    node = _init_declared({'auth.allow_example_token': True}, token=LOWER_PLACEHOLDER,
+                          host='127.0.0.1')
+    assert node.logger_double.warning.called
+    assert LOWER_PLACEHOLDER not in str(node.logger_double.method_calls)
+    _declared_refusal({'auth.allow_example_token': True}, token=LOWER_PLACEHOLDER,
+                      host='0.0.0.0')
+
+
+# --- the YAML files shipped in param/ declare without error --------------------------------
+
+def _yaml_variant(file_name, variant):
+    flat = _flat(copy.deepcopy(_shipped_params(file_name)))
+    out = {}
+    for name, value in flat.items():
+        if name in bridge.DYNAMIC_PARAMETERS and isinstance(value, (int, float)) \
+                and not isinstance(value, bool):
+            if variant == 'to_float':
+                value = float(value)
+            elif variant == 'to_int' and float(value).is_integer():
+                value = int(value)
+        out[name] = value
+    return out
+
+
+@pytest.mark.parametrize('variant', ['as_is', 'to_float', 'to_int'])
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_the_shipped_yaml_files_declare_and_start_with_the_realistic_fake(
+        file_name, variant):
+    values = _yaml_variant(file_name, variant)
+    values['auth.token'] = STRONG_TOKEN
+    node = _init_declared(values)
+    assert node.port == 8080 and node.host == '0.0.0.0'
+    assert node._map_min_free_mb == 200 and node._map_min_interval_s == 5.0
+    assert not node.logger_double.warning.called
+
+
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_the_shipped_yaml_files_declare_only_known_parameters(file_name):
+    known = {name for name, _ in bridge.PARAMETERS}
+    assert set(_flat(_shipped_params(file_name))) <= known
+
+
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_the_shipped_yaml_types_match_the_declared_defaults_for_static_parameters(file_name):
+    defaults = dict(bridge.PARAMETERS)
+    for name, value in _flat(_shipped_params(file_name)).items():
+        if name not in bridge.DYNAMIC_PARAMETERS:
+            assert _rclpy_type(value) == _rclpy_type(defaults[name]), name

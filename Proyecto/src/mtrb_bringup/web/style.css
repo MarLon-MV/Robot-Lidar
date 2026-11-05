@@ -11,7 +11,7 @@
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-#app { display: grid; height: 100%; grid-template-rows: auto 1fr auto;
+#app { display: grid; height: 100%; padding-bottom: calc(64px + env(safe-area-inset-bottom, 0px)); grid-template-rows: auto 1fr auto;
   grid-template-areas: "top" "stage" "panel"; }
 #topbar { grid-area: top; display: flex; align-items: center; gap: 12px;
   padding: 8px 12px; background: var(--panel); }
@@ -19,7 +19,8 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
 #stage { grid-area: stage; position: relative; min-height: 0; overflow: hidden; }
 #view { width: 100%; height: 100%; display: block; touch-action: none; background: #5a6572; cursor: grab; }
 #view:active { cursor: grabbing; }
-#panel { grid-area: panel; background: var(--panel); padding: 8px 12px; }
+#panel { grid-area: panel; background: var(--panel); padding: 8px 12px 28px; min-height: 0;
+  max-height: 45vh; overflow-y: auto; }
 #panel dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 0.9rem; }
 #panel dt { color: var(--muted); }
 #panel dd { margin: 0; }
@@ -76,4 +77,46 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 @media (min-width: 800px) {
   #app { grid-template-rows: auto 1fr; grid-template-columns: 1fr 260px;
     grid-template-areas: "top top" "stage panel"; }
+  #panel { max-height: none; }
 }
+
+/* Emergency stop: fixed full-width bar, always above every other layer. */
+#stop-bar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 100;
+  padding-bottom: env(safe-area-inset-bottom, 0px); background: #5c0a0e; }
+.btn-parar { display: block; width: 100%; height: 64px; min-height: 56px; font-size: 1.6rem;
+  font-weight: 800; letter-spacing: 0.12em; color: #fff; background: #d00000; border: 3px solid #fff;
+  border-radius: 0; touch-action: manipulation; }
+.btn-parar:hover { background: #f00; }
+.btn-parar:focus-visible { outline: 4px solid #ffe600; outline-offset: -8px; }
+#stop-status { position: absolute; left: 0; right: 0; bottom: 100%; margin: 0; padding: 8px 12px;
+  font-weight: 700; text-align: center; color: #fff; background: #0b5d2e; }
+#stop-status.msg-error { background: #b3261e; color: #fff; }
+#stop-status[hidden], #teleop-msg[hidden], #joystick[hidden] { display: none; }
+#teleop-box { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+#teleop-box .hint, #teleop-box .msg { flex-basis: 100%; margin: 0; }
+#joystick { position: absolute; right: 12px; bottom: 12px; width: 150px; height: 150px; border-radius: 50%;
+  background: rgba(28, 35, 45, 0.85); border: 3px solid var(--accent); touch-action: none;
+  user-select: none; -webkit-user-select: none; }
+#joystick-knob { position: absolute; left: 50%; top: 50%; width: 56px; height: 56px; margin: -28px 0 0 -28px;
+  border-radius: 50%; background: var(--accent); border: 2px solid #fff; pointer-events: none; }
+
+/* Status panel, map saving, layers. The panel scrolls inside itself: it never grows over PARAR. */
+#panel summary { cursor: pointer; font-weight: 600; padding: 6px 0; min-height: 32px; }
+#panel details { border-top: 1px solid #2b3644; margin-top: 4px; }
+.nodes, .maps { list-style: none; margin: 0; padding: 0; }
+.nodes li { font-size: 0.85rem; overflow-wrap: anywhere; }
+.maps li { font-size: 0.9rem; padding: 2px 0; overflow-wrap: anywhere; }
+.node-ok { color: var(--green); }
+.node-warn { color: var(--amber); }
+.node-bad { color: var(--red); }
+.warn { color: var(--amber); font-weight: 700; }
+.msg-warn { background: rgba(245, 166, 35, 0.18); color: var(--amber); }
+.subhead { font-size: 0.95rem; margin: 10px 0 4px; }
+#map-form { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+#map-form .hint, #map-form .msg { margin: 0; }
+#map-name { font: inherit; padding: 8px; border-radius: 6px; border: 1px solid #3d4b5d;
+  background: #0e1218; color: var(--fg); width: 100%; }
+#map-name[aria-invalid="true"] { border-color: var(--red); }
+#overwrite-confirm { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+#overwrite-confirm[hidden], #map-name-error[hidden], #map-save-msg[hidden], #map-list-state[hidden],
+#st-stale[hidden] { display: none; }

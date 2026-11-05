@@ -1,12 +1,19 @@
 """Unit tests for mtrb_bringup.web_utils (pure Python, no ROS needed)."""
 
 import math
+import os
+import types
 import zlib
 
-from mtrb_bringup.web_utils import (clamp_twist, downsample_scan, occupancy_to_bytes,
-                                    quaternion_from_yaw, scan_to_map_points,
-                                    simplify_path, valid_map_name,
-                                    validate_goal, yaw_from_quaternion)
+from mtrb_bringup import web_utils
+from mtrb_bringup.web_utils import (clamp_twist, downsample_scan, existing_map_files,
+                                    is_reserved_map_name, list_maps, listable_map_name,
+                                    map_image_saved, MAP_PATH_PATTERN, MAP_SCAN_MAX_ENTRIES,
+                                    MapPathError, occupancy_to_bytes, posegraph_saved,
+                                    quaternion_from_yaw, ReservedMapNameError,
+                                    resolve_map_base, safe_map_dir, scan_to_map_points,
+                                    simplify_path, valid_map_name, validate_goal,
+                                    yaw_from_quaternion)
 import pytest
 
 NAN = float('nan')
@@ -284,7 +291,8 @@ def test_map_name_valid(name):
 
 
 @pytest.mark.parametrize('name', ['../x', '', 'x' * 41, 'my map', 'abc\n', '\nabc',
-                                  'a/b', 'a.b', 'ñandú', ' a', 'a '])
+                                  'a/b', 'a.b', 'ñandú', ' a', 'a ', '-x', '-', '--help',
+                                  '.', '..', 'ñ'])
 def test_map_name_invalid_string_raises(name):
     with pytest.raises(ValueError):
         valid_map_name(name)
@@ -644,3 +652,618 @@ def test_pack_map_binary_rejects_invalid_version(version):
     from mtrb_bringup.web_utils import pack_map_binary
     with pytest.raises(ValueError):
         pack_map_binary(version, b'')
+
+
+# --- phase 4: huge integers (10**400 overflow float()) ---------------------------------------
+# Every helper must refuse them with ValueError (or drop the beam) and never leak an
+# OverflowError, which would become an HTTP 500 or kill a ROS callback.
+
+HUGE = 10 ** 400
+
+
+@pytest.mark.parametrize('huge', [HUGE, -HUGE])
+def test_clamp_twist_huge_velocity_raises_value_error(huge):
+    with pytest.raises(ValueError):
+        clamp_twist(huge, 0.0, 0.2, 0.8)
+    with pytest.raises(ValueError):
+        clamp_twist(0.0, huge, 0.2, 0.8)
+
+
+def test_clamp_twist_huge_limit_raises_value_error():
+    with pytest.raises(ValueError):
+        clamp_twist(0.1, 0.1, HUGE, 0.8)
+    with pytest.raises(ValueError):
+        clamp_twist(0.1, 0.1, 0.2, HUGE)
+
+
+def test_clamp_twist_still_saturates_normal_values():
+    assert clamp_twist(9.0, -9.0, 0.2, 0.8) == (0.2, -0.8)
+
+
+MAP_INFO = {'width': 2, 'height': 2, 'resolution': 1.0, 'origin_x': 0.0, 'origin_y': 0.0,
+            'data': [0, 0, 0, 0]}
+
+
+@pytest.mark.parametrize('coords', [(HUGE, 0.5, 0.0), (0.5, HUGE, 0.0), (0.5, 0.5, HUGE),
+                                    (-HUGE, 0.5, 0.0)])
+def test_validate_goal_huge_x_y_yaw_raises_value_error(coords):
+    with pytest.raises(ValueError):
+        validate_goal(*coords, MAP_INFO)
+
+
+@pytest.mark.parametrize('field', ['width', 'height', 'resolution', 'origin_x', 'origin_y'])
+def test_validate_goal_huge_map_info_raises_value_error(field):
+    info = dict(MAP_INFO, **{field: HUGE})
+    with pytest.raises(ValueError):
+        validate_goal(0.5, 0.5, 0.0, info)
+
+
+def test_validate_goal_huge_cell_value_raises_value_error():
+    info = dict(MAP_INFO, data=[0, 0, HUGE, 0])
+    with pytest.raises(ValueError):
+        validate_goal(0.5, 1.5, 0.0, info)       # cell index 2
+
+
+def test_validate_goal_huge_cell_elsewhere_is_ignored():
+    info = dict(MAP_INFO, data=[0, 0, HUGE, 0])
+    assert validate_goal(0.5, 0.5, 0.0, info) == (0.5, 0.5, 0.0)
+
+
+def test_downsample_scan_drops_a_huge_integer_range():
+    result = downsample_scan([1.0, HUGE, -HUGE, 2.0], 0.0, 0.5, 10)
+    assert [r for r, _ in result] == [1.0, 2.0]
+    assert result[1][1] == pytest.approx(1.5)    # the angle keeps the original beam index
+
+
+@pytest.mark.parametrize('field', ['angle_min', 'angle_increment', 'r_min', 'r_max'])
+def test_downsample_scan_huge_parameter_raises_value_error(field):
+    kwargs = {'angle_min': 0.0, 'angle_increment': 0.1, 'r_min': 0.15, 'r_max': 12.0}
+    kwargs[field] = HUGE
+    with pytest.raises(ValueError):
+        downsample_scan([1.0], kwargs['angle_min'], kwargs['angle_increment'], 10,
+                        r_min=kwargs['r_min'], r_max=kwargs['r_max'])
+
+
+def test_scan_to_map_points_huge_range_or_angle_raises_value_error():
+    with pytest.raises(ValueError):
+        scan_to_map_points([(HUGE, 0.0)], (0.0, 0.0, 0.0))
+    with pytest.raises(ValueError):
+        scan_to_map_points([(1.0, HUGE)], (0.0, 0.0, 0.0))
+
+
+@pytest.mark.parametrize('pose', [(HUGE, 0.0, 0.0), (0.0, HUGE, 0.0), (0.0, 0.0, HUGE)])
+def test_scan_to_map_points_huge_pose_raises_value_error(pose):
+    with pytest.raises(ValueError):
+        scan_to_map_points([(1.0, 0.0)], pose)
+
+
+@pytest.mark.parametrize('point', [[HUGE, 0.0], [0.0, HUGE], [-HUGE, 1.0]])
+def test_simplify_path_huge_coordinate_raises_value_error(point):
+    with pytest.raises(ValueError):
+        simplify_path([[0.0, 0.0], point, [2.0, 2.0]], 10)
+
+
+def test_simplify_path_huge_coordinate_in_a_decimated_path_raises_value_error():
+    points = [[float(i), 0.0] for i in range(10)]
+    points[5] = [HUGE, 0.0]
+    with pytest.raises(ValueError):
+        simplify_path(points, 3)
+
+
+@pytest.mark.parametrize('width,height', [(HUGE, 2), (2, HUGE)])
+def test_occupancy_huge_size_raises_value_error(width, height):
+    with pytest.raises(ValueError):
+        occupancy_to_bytes([0, 0, 0, 0], width, height)
+
+
+def test_occupancy_huge_cell_value_never_leaks_an_overflow_error():
+    # Python ints do not overflow on `& 0xFF`, so the cell wraps like any out-of-range int8
+    # (existing behaviour); what must never happen is an OverflowError (or any other type).
+    try:
+        packed = occupancy_to_bytes([0, HUGE, 0, 0], 2, 2)
+    except ValueError:
+        return
+    assert len(zlib.decompress(packed)) == 4
+
+
+@pytest.mark.parametrize('yaw', [HUGE, -HUGE])
+def test_quaternion_from_yaw_huge_raises_value_error(yaw):
+    with pytest.raises(ValueError):
+        quaternion_from_yaw(yaw)
+
+
+@pytest.mark.parametrize('index', range(4))
+def test_yaw_from_quaternion_huge_component_raises_value_error(index):
+    components = [0.0, 0.0, 0.0, 1.0]
+    components[index] = HUGE
+    with pytest.raises(ValueError):
+        yaw_from_quaternion(*components)
+
+
+# --- Phase 5: saved-map path helpers -------------------------------------------------------
+# Everything below uses real files in pytest's tmp_path (no mocks of the filesystem), except
+# the 10000-entries bound of list_maps, which uses a lazy fake scandir.
+
+@pytest.fixture
+def root(tmp_path):
+    """Return a real directory whose path slam_toolbox accepts (else skip: test is moot)."""
+    real = os.path.realpath(str(tmp_path))
+    if MAP_PATH_PATTERN.fullmatch(real) is None:
+        pytest.skip(f'tmp_path has characters outside [A-Za-z0-9_./-]: {real}')
+    return real
+
+
+def _touch(path, content=b'x'):
+    with open(path, 'wb') as handle:
+        handle.write(content)
+
+
+def _make_map(directory, name, image='.pgm'):
+    _touch(os.path.join(directory, name + '.yaml'))
+    _touch(os.path.join(directory, name + image))
+
+
+# safe_map_dir
+
+def test_safe_map_dir_returns_the_real_path_of_an_existing_directory(root):
+    assert safe_map_dir(root) == root
+
+
+@pytest.mark.parametrize('bad', [None, '', 5, 1.5, True, [], b'/tmp', 'maps', './maps',
+                                 '../maps', 'a/b'])
+def test_safe_map_dir_rejects_non_absolute_or_non_string(bad):
+    with pytest.raises(MapPathError):
+        safe_map_dir(bad)
+
+
+def test_safe_map_dir_rejects_a_missing_directory(root):
+    with pytest.raises(MapPathError):
+        safe_map_dir(os.path.join(root, 'missing'))
+
+
+def test_safe_map_dir_rejects_a_file(root):
+    _touch(os.path.join(root, 'plain'))
+    with pytest.raises(MapPathError):
+        safe_map_dir(os.path.join(root, 'plain'))
+
+
+def test_safe_map_dir_rejects_the_filesystem_root():
+    with pytest.raises(MapPathError):
+        safe_map_dir('/')
+
+
+def test_safe_map_dir_rejects_a_root_reached_through_dots():
+    with pytest.raises(MapPathError):
+        safe_map_dir('/..')
+
+
+@pytest.mark.parametrize('dirname', [
+    'with space', 'semi;colon', 'dollar$x', 'quote"d', "single'q", 'back`tick', 'pipe|x',
+    'amp&x', 'ñandú', 'tab\there', 'new\nline', 'star*', 'paren(x)', 'plus+x', 'eq=x'])
+def test_safe_map_dir_rejects_characters_outside_the_slam_toolbox_set(root, dirname):
+    path = os.path.join(root, dirname)
+    os.mkdir(path)
+    with pytest.raises(MapPathError):
+        safe_map_dir(path)
+
+
+def test_safe_map_dir_accepts_the_whole_allowed_character_set(root):
+    path = os.path.join(root, 'aZ09_-.x')
+    os.mkdir(path)
+    assert safe_map_dir(path) == path
+
+
+def test_safe_map_dir_resolves_dot_dot_so_the_result_has_no_dots(root):
+    os.mkdir(os.path.join(root, 'a'))
+    os.mkdir(os.path.join(root, 'b'))
+    result = safe_map_dir(os.path.join(root, 'a', '..', 'b'))
+    assert result == os.path.join(root, 'b')
+    assert '..' not in result.split(os.sep)
+
+
+def test_safe_map_dir_collapses_double_slashes(root):
+    os.mkdir(os.path.join(root, 'sub'))
+    result = safe_map_dir(root + '//sub//')
+    assert result == os.path.join(root, 'sub')
+    assert '//' not in result
+
+
+def test_safe_map_dir_returns_the_target_of_a_symlinked_directory(root):
+    os.mkdir(os.path.join(root, 'real'))
+    os.symlink(os.path.join(root, 'real'), os.path.join(root, 'link'))
+    assert safe_map_dir(os.path.join(root, 'link')) == os.path.join(root, 'real')
+
+
+def test_safe_map_dir_rejects_a_symlink_whose_target_has_bad_characters(root):
+    os.mkdir(os.path.join(root, 'bad dir'))
+    os.symlink(os.path.join(root, 'bad dir'), os.path.join(root, 'link'))
+    with pytest.raises(MapPathError):
+        safe_map_dir(os.path.join(root, 'link'))
+
+
+def test_safe_map_dir_rejects_a_dangling_symlink(root):
+    os.symlink(os.path.join(root, 'nowhere'), os.path.join(root, 'link'))
+    with pytest.raises(MapPathError):
+        safe_map_dir(os.path.join(root, 'link'))
+
+
+def test_map_path_error_is_a_value_error_but_not_every_value_error_is_one():
+    assert issubclass(MapPathError, ValueError)
+    with pytest.raises(ValueError) as caught:
+        valid_map_name('bad name')
+    assert not isinstance(caught.value, MapPathError)
+
+
+# resolve_map_base
+
+def test_resolve_map_base_returns_an_absolute_path_inside_the_real_directory(root):
+    base = resolve_map_base(root, 'lab')
+    assert base == os.path.join(root, 'lab')
+    assert os.path.isabs(base)
+    assert MAP_PATH_PATTERN.fullmatch(base) is not None
+
+
+def test_resolve_map_base_follows_a_symlinked_map_dir_to_the_real_one(root):
+    os.mkdir(os.path.join(root, 'real'))
+    os.symlink(os.path.join(root, 'real'), os.path.join(root, 'link'))
+    assert resolve_map_base(os.path.join(root, 'link'), 'lab') == os.path.join(
+        root, 'real', 'lab')
+
+
+@pytest.mark.parametrize('name', [
+    '../x', '..', '.', 'a/b', '/abs', '', ' ', 'a b', 'a.b', 'x' * 41, 'ñ', 'a\x00b', 'a\n',
+    None, 5, True, ['a'], b'abc'])
+def test_resolve_map_base_rejects_invalid_names_with_a_plain_value_error(root, name):
+    with pytest.raises(ValueError) as caught:
+        resolve_map_base(root, name)
+    assert not isinstance(caught.value, MapPathError)
+
+
+@pytest.mark.parametrize('name', ['_', '0', 'x' * 40, 'A-b_9', '_-x', 'a-'])
+def test_resolve_map_base_valid_names_stay_absolute_and_confined(root, name):
+    base = resolve_map_base(root, name)
+    assert base.startswith('/')
+    assert os.path.dirname(base) == root
+    assert not os.path.basename(base).startswith('-')
+
+
+@pytest.mark.parametrize('name', ['-h', '--help', '-', '-x', '-rf', '--', '-' + 'a' * 39])
+def test_resolve_map_base_rejects_names_starting_with_a_dash(root, name):
+    # A leading '-' could be read as an option by a shell: the name is refused outright
+    # (plain ValueError, not a reserved name) and no path is ever built from it.
+    with pytest.raises(ValueError) as caught:
+        resolve_map_base(root, name)
+    assert not isinstance(caught.value, (MapPathError, ReservedMapNameError))
+    with pytest.raises(ValueError):
+        valid_map_name(name)
+
+
+@pytest.mark.parametrize('name', ['a', 'lab_1', 'x', '_x', '9-9', 'z' * 40, 'A-b_9'])
+def test_no_valid_map_name_yields_a_path_component_starting_with_a_dash(root, name):
+    assert not os.path.basename(resolve_map_base(root, name)).startswith('-')
+
+
+@pytest.mark.parametrize('name', ['map', 'MAP', 'Map', 'mAp', 'mAP'])
+def test_resolve_map_base_and_valid_map_name_reject_reserved_names_case_insensitively(
+        root, name):
+    for call in (lambda: valid_map_name(name), lambda: resolve_map_base(root, name)):
+        with pytest.raises(ReservedMapNameError) as caught:
+            call()
+        assert isinstance(caught.value, ValueError)
+    assert is_reserved_map_name(name)
+    assert not listable_map_name(name)
+
+
+@pytest.mark.parametrize('name', ['maps', 'map1', 'my_map', 'map-', '_map', 'mapa'])
+def test_names_merely_containing_map_are_not_reserved(root, name):
+    assert valid_map_name(name) == name
+    assert not is_reserved_map_name(name)
+    assert listable_map_name(name)
+
+
+def test_reserved_name_error_is_a_value_error_but_other_invalid_names_are_not_reserved():
+    assert issubclass(ReservedMapNameError, ValueError)
+    with pytest.raises(ValueError) as caught:
+        valid_map_name('-x')
+    assert not isinstance(caught.value, ReservedMapNameError)
+
+
+@pytest.mark.parametrize('name', ['', 'x' * 41, '.', '..', 'a/b', 'ñ', '-', '--help'])
+def test_listable_map_name_is_false_for_invalid_names(name):
+    assert not listable_map_name(name)
+
+
+@pytest.mark.parametrize('bad', [None, 5, b'map', ['map']])
+def test_is_reserved_and_listable_are_false_for_non_strings(bad):
+    assert not is_reserved_map_name(bad)
+    assert not listable_map_name(bad)
+
+
+@pytest.mark.parametrize('bad_dir', [None, '', 'relative', '/nonexistent-dir-for-tests'])
+def test_resolve_map_base_rejects_an_unusable_directory(bad_dir):
+    with pytest.raises(MapPathError):
+        resolve_map_base(bad_dir, 'lab')
+
+
+@pytest.mark.parametrize('ext', ['.yaml', '.pgm', '.png', '.posegraph', '.data',
+                                 '.yaml.bak', '.pgm.bak', '.png.bak', '.posegraph.bak',
+                                 '.data.bak'])
+def test_resolve_map_base_refuses_a_symlink_among_the_files(root, ext):
+    _touch(os.path.join(root, 'elsewhere'))
+    os.symlink(os.path.join(root, 'elsewhere'), os.path.join(root, 'lab' + ext))
+    with pytest.raises(MapPathError):
+        resolve_map_base(root, 'lab')
+
+
+def test_resolve_map_base_refuses_a_dangling_symlink(root):
+    os.symlink(os.path.join(root, 'nowhere'), os.path.join(root, 'lab.yaml'))
+    with pytest.raises(MapPathError):
+        resolve_map_base(root, 'lab')
+
+
+def test_resolve_map_base_refuses_a_symlink_pointing_inside_the_same_directory(root):
+    _touch(os.path.join(root, 'other.yaml'))
+    os.symlink(os.path.join(root, 'other.yaml'), os.path.join(root, 'lab.yaml'))
+    with pytest.raises(MapPathError):
+        resolve_map_base(root, 'lab')
+
+
+@pytest.mark.parametrize('ext', ['.yaml', '.pgm', '.data', '.yaml.bak', '.posegraph.bak'])
+def test_resolve_map_base_refuses_a_directory_instead_of_a_file(root, ext):
+    os.mkdir(os.path.join(root, 'lab' + ext))
+    with pytest.raises(MapPathError):
+        resolve_map_base(root, 'lab')
+
+
+def test_resolve_map_base_accepts_existing_plain_files_and_backups(root):
+    for ext in ('.yaml', '.pgm', '.posegraph', '.data', '.yaml.bak', '.pgm.bak'):
+        _touch(os.path.join(root, 'lab' + ext))
+    assert resolve_map_base(root, 'lab') == os.path.join(root, 'lab')
+
+
+def test_resolve_map_base_ignores_symlinks_of_other_maps(root):
+    _touch(os.path.join(root, 'elsewhere'))
+    os.symlink(os.path.join(root, 'elsewhere'), os.path.join(root, 'other.yaml'))
+    assert resolve_map_base(root, 'lab') == os.path.join(root, 'lab')
+
+
+def test_resolve_map_base_does_not_create_anything(root):
+    resolve_map_base(root, 'lab')
+    assert os.listdir(root) == []
+
+
+# existing_map_files
+
+def test_existing_map_files_lists_every_related_file_and_nothing_else(root):
+    base = os.path.join(root, 'lab')
+    for ext in ('.yaml', '.pgm', '.png', '.posegraph', '.data', '.yaml.bak', '.txt'):
+        _touch(base + ext)
+    _touch(os.path.join(root, 'lab2.yaml'))
+    assert existing_map_files(base) == [base + e for e in (
+        '.yaml', '.pgm', '.png', '.posegraph', '.data')]
+
+
+def test_existing_map_files_reports_a_lone_data_file(root):
+    base = os.path.join(root, 'lab')
+    _touch(base + '.data')
+    assert existing_map_files(base) == [base + '.data']
+
+
+def test_existing_map_files_is_empty_for_a_new_name(root):
+    assert existing_map_files(os.path.join(root, 'new')) == []
+
+
+def test_existing_map_files_includes_dangling_symlinks(root):
+    base = os.path.join(root, 'lab')
+    os.symlink(os.path.join(root, 'nowhere'), base + '.yaml')
+    assert existing_map_files(base) == [base + '.yaml']
+
+
+# map_image_saved / posegraph_saved
+
+@pytest.mark.parametrize('image', ['.pgm', '.png'])
+def test_map_image_saved_true_with_yaml_and_either_image(root, image):
+    _make_map(root, 'lab', image)
+    assert map_image_saved(os.path.join(root, 'lab')) is True
+
+
+def test_map_image_saved_false_with_only_the_yaml(root):
+    _touch(os.path.join(root, 'lab.yaml'))
+    assert map_image_saved(os.path.join(root, 'lab')) is False
+
+
+def test_map_image_saved_false_with_only_the_image(root):
+    _touch(os.path.join(root, 'lab.pgm'))
+    assert map_image_saved(os.path.join(root, 'lab')) is False
+
+
+@pytest.mark.parametrize('empty', ['.yaml', '.pgm'])
+def test_map_image_saved_false_when_a_file_is_empty(root, empty):
+    _make_map(root, 'lab')
+    _touch(os.path.join(root, 'lab' + empty), b'')
+    assert map_image_saved(os.path.join(root, 'lab')) is False
+
+
+def test_map_image_saved_false_for_a_symlinked_yaml(root):
+    _touch(os.path.join(root, 'real.yaml'))
+    _touch(os.path.join(root, 'lab.pgm'))
+    os.symlink(os.path.join(root, 'real.yaml'), os.path.join(root, 'lab.yaml'))
+    assert map_image_saved(os.path.join(root, 'lab')) is False
+
+
+def test_map_image_saved_false_for_a_symlinked_image(root):
+    _touch(os.path.join(root, 'lab.yaml'))
+    _touch(os.path.join(root, 'real.pgm'))
+    os.symlink(os.path.join(root, 'real.pgm'), os.path.join(root, 'lab.pgm'))
+    assert map_image_saved(os.path.join(root, 'lab')) is False
+
+
+def test_map_image_saved_false_for_a_directory_named_like_the_yaml(root):
+    os.mkdir(os.path.join(root, 'lab.yaml'))
+    _touch(os.path.join(root, 'lab.pgm'))
+    assert map_image_saved(os.path.join(root, 'lab')) is False
+
+
+def test_posegraph_saved_true_with_both_files(root):
+    _touch(os.path.join(root, 'lab.posegraph'))
+    _touch(os.path.join(root, 'lab.data'))
+    assert posegraph_saved(os.path.join(root, 'lab')) is True
+
+
+@pytest.mark.parametrize('present', ['.posegraph', '.data'])
+def test_posegraph_saved_false_with_only_one_file(root, present):
+    _touch(os.path.join(root, 'lab' + present))
+    assert posegraph_saved(os.path.join(root, 'lab')) is False
+
+
+def test_posegraph_saved_false_when_one_file_is_empty(root):
+    _touch(os.path.join(root, 'lab.posegraph'))
+    _touch(os.path.join(root, 'lab.data'), b'')
+    assert posegraph_saved(os.path.join(root, 'lab')) is False
+
+
+def test_posegraph_saved_false_for_a_symlink(root):
+    _touch(os.path.join(root, 'real'))
+    _touch(os.path.join(root, 'lab.data'))
+    os.symlink(os.path.join(root, 'real'), os.path.join(root, 'lab.posegraph'))
+    assert posegraph_saved(os.path.join(root, 'lab')) is False
+
+
+# list_maps
+
+def test_list_maps_returns_sorted_names_of_complete_maps(root):
+    _make_map(root, 'zeta')
+    _make_map(root, 'alpha', '.png')
+    _make_map(root, 'Beta')
+    assert list_maps(root) == ['Beta', 'alpha', 'zeta']
+
+
+def test_list_maps_is_empty_for_a_missing_directory(root):
+    assert list_maps(os.path.join(root, 'missing')) == []
+
+
+@pytest.mark.parametrize('bad', [None, 5, b'/tmp', ['x']])
+def test_list_maps_is_empty_for_a_non_string_directory(bad):
+    assert list_maps(bad) == []
+
+
+def test_list_maps_is_empty_for_an_empty_directory(root):
+    assert list_maps(root) == []
+
+
+def test_list_maps_returns_at_most_200_sorted_names(root):
+    names = [f'm{i:03d}' for i in range(250)]
+    for name in reversed(names):
+        _make_map(root, name)
+    result = list_maps(root)
+    assert len(result) == web_utils.MAP_LIST_LIMIT == 200
+    assert result == names[:200]
+
+
+def test_list_maps_honours_an_explicit_limit(root):
+    for name in ('c', 'a', 'b', 'd'):
+        _make_map(root, name)
+    assert list_maps(root, 2) == ['a', 'b']
+
+
+def test_list_maps_ignores_yaml_without_image_and_image_without_yaml(root):
+    _touch(os.path.join(root, 'onlyyaml.yaml'))
+    _touch(os.path.join(root, 'onlyimage.pgm'))
+    _make_map(root, 'good')
+    assert list_maps(root) == ['good']
+
+
+def test_list_maps_never_lists_reserved_or_dash_names_even_if_the_files_exist(root):
+    for name in ('map', 'Map', 'MAP', '-x', '-', '--help'):
+        _make_map(root, name)
+    _make_map(root, 'lab')
+    assert list_maps(root) == ['lab']
+
+
+def test_list_maps_ignores_invalid_names(root):
+    for name in ('with space', 'dots.in.name', 'x' * 41, 'ñandú', 'semi;colon'):
+        _make_map(root, name)
+    _make_map(root, 'x' * 40)
+    assert list_maps(root) == ['x' * 40]
+
+
+def test_list_maps_ignores_other_extensions(root):
+    _touch(os.path.join(root, 'a.yml'))
+    _touch(os.path.join(root, 'a.pgm'))
+    _touch(os.path.join(root, 'b.YAML'))
+    _touch(os.path.join(root, 'b.pgm'))
+    assert list_maps(root) == []
+
+
+def test_list_maps_ignores_symlinked_yaml_and_symlinked_images(root):
+    _make_map(root, 'real')
+    os.symlink(os.path.join(root, 'real.yaml'), os.path.join(root, 'linkyaml.yaml'))
+    _touch(os.path.join(root, 'linkyaml.pgm'))
+    _touch(os.path.join(root, 'linkimg.yaml'))
+    os.symlink(os.path.join(root, 'real.pgm'), os.path.join(root, 'linkimg.pgm'))
+    assert list_maps(root) == ['real']
+
+
+def test_list_maps_ignores_a_directory_named_like_a_yaml(root):
+    os.mkdir(os.path.join(root, 'dirmap.yaml'))
+    _touch(os.path.join(root, 'dirmap.pgm'))
+    assert list_maps(root) == []
+
+
+def test_list_maps_ignores_a_map_whose_image_is_empty(root):
+    # Spec: the image must be a regular, non-empty file (an empty yaml is not checked).
+    _touch(os.path.join(root, 'empty.yaml'))
+    _touch(os.path.join(root, 'empty.pgm'), b'')
+    assert list_maps(root) == []
+
+
+def test_list_maps_ignores_backups(root):
+    _touch(os.path.join(root, 'old.yaml.bak'))
+    _touch(os.path.join(root, 'old.pgm.bak'))
+    assert list_maps(root) == []
+
+
+def test_list_maps_refuses_a_relative_existing_directory(root, monkeypatch):
+    os.mkdir(os.path.join(root, 'rel'))
+    monkeypatch.chdir(root)
+    with pytest.raises(MapPathError):
+        list_maps('rel')
+
+
+def test_list_maps_refuses_a_directory_with_bad_characters(root):
+    path = os.path.join(root, 'bad dir')
+    os.mkdir(path)
+    with pytest.raises(MapPathError):
+        list_maps(path)
+
+
+def test_list_maps_never_inspects_more_than_10000_directory_entries(root, monkeypatch):
+    _make_map(root, 'inside')    # entry index 9999: still inspected
+    _make_map(root, 'outside')   # entry index 10000: must not be reached
+    consumed = []
+
+    def entry(name):
+        return types.SimpleNamespace(name=name, is_file=lambda follow_symlinks=True: True,
+                                     is_symlink=lambda: False)
+
+    def entries():
+        for index in range(MAP_SCAN_MAX_ENTRIES + 50):
+            consumed.append(index)
+            if index == MAP_SCAN_MAX_ENTRIES - 1:
+                yield entry('inside.yaml')
+            elif index == MAP_SCAN_MAX_ENTRIES:
+                yield entry('outside.yaml')
+            else:
+                yield entry(f'junk{index}.txt')
+
+    class FakeScandir:
+        def __enter__(self):
+            return entries()
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(web_utils.os, 'scandir', lambda path: FakeScandir())
+    assert MAP_SCAN_MAX_ENTRIES == 10000
+    assert list_maps(root) == ['inside']
+    assert len(consumed) <= MAP_SCAN_MAX_ENTRIES + 1
