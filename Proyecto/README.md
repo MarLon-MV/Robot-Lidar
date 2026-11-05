@@ -93,6 +93,7 @@ src/
     └── test/                    # unitarias, integración y lint
 requirements-web.txt             # dependencias Python del puente web (fastapi, uvicorn)
 env.sh
+scripts/patch_ldlidar.sh          # parche del driver ldlidar para GCC 13 (tras vcs import)
 mtrb.repos                       # código de terceros (driver ldlidar_stl_ros2) → vcs import
 ```
 
@@ -129,12 +130,15 @@ cd ~/Robot-Lidar/Proyecto
 # Driver del LD19 (ldlidar_stl_ros2), que no está en apt: se descarga dentro de src/
 sudo apt install -y python3-vcstool
 vcs import src < mtrb.repos
+
+# Parche para compilar el driver con GCC 13 (Jazzy): falta #include <pthread.h> y hay una errata
+scripts/patch_ldlidar.sh
 ```
 
 [mtrb.repos](mtrb.repos) lista el código de terceros que se compila en el workspace. La carpeta
 `src/ldlidar_stl_ros2/` está en `.gitignore`: no se sube a este repositorio.
 
-Para actualizar más adelante: `cd ~/Robot-Lidar/Proyecto && git pull && vcs pull src` y vuelve a compilar
+Para actualizar más adelante: `cd ~/Robot-Lidar/Proyecto && git pull && vcs pull src && scripts/patch_ldlidar.sh` y vuelve a compilar
 (paso 1.5).
 
 ### 1.3 Instalar las dependencias
