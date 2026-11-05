@@ -18,7 +18,7 @@ REQUIRED_ARGS = {
     'mode', 'namespace', 'map', 'posegraph', 'navigation', 'use_ekf', 'scan_topic',
     'odom_topic', 'imu_topic', 'lidar_frame', 'dock_x', 'dock_y', 'dock_yaw',
     'lidar', 'lidar_port', 'lidar_params_file',
-    'web', 'web_port', 'web_params_file',
+    'web', 'web_port', 'web_params_file', 'explore', 'explore_params_file',
 }
 
 

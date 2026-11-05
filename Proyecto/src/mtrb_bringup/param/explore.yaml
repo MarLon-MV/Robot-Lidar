@@ -1,0 +1,19 @@
+# explore_lite (m-explore-ros2): autonomous frontier exploration, only with
+# `mode:=mapping explore:=true`. It sends goals to Nav2 (navigate_to_pose) and so inherits the
+# Nav2 speed limits and obstacle avoidance. PARAR in the web pauses it (explore/resume = false).
+# Values marked INITIAL are starting points to tune on the real robot.
+explore_node:
+  ros__parameters:
+    robot_base_frame: base_link
+    # Nav2 global costmap (inflated, so frontiers keep away from walls). Relative to the namespace.
+    costmap_topic: global_costmap/costmap
+    costmap_updates_topic: global_costmap/costmap_updates
+    visualize: true
+    planner_frequency: 0.2        # INITIAL: Hz, one new frontier goal every 5 s
+    progress_timeout: 30.0        # s without progress before the frontier is blacklisted
+    potential_scale: 3.0          # weight of the distance to the frontier
+    orientation_scale: 0.0
+    gain_scale: 1.0               # weight of the frontier size
+    min_frontier_size: 0.5        # INITIAL: m, ignore smaller frontiers
+    transform_tolerance: 0.3
+    return_to_init: true          # at the end, go back to where the exploration started (dock)

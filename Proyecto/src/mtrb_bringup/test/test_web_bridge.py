@@ -729,11 +729,12 @@ def test_init_ros_io_teleop_watchdog_has_its_own_callback_group():
             assert 'callback_group' not in call.kwargs, name
 
 
-def test_init_ros_io_creates_exactly_the_initialpose_and_cmd_vel_nav_publishers():
+def test_init_ros_io_creates_exactly_the_initialpose_cmd_vel_nav_and_explore_resume_publishers():
     node = _io_node()
     created = {c.args[1]: c.args[0] for c in node.create_publisher.call_args_list}
-    assert len(node.create_publisher.call_args_list) == 2
-    assert set(created) == {'initialpose', 'cmd_vel_nav'}
+    assert len(node.create_publisher.call_args_list) == 3
+    assert set(created) == {'initialpose', 'cmd_vel_nav', 'explore/resume'}
+    assert created['explore/resume'] is bridge.Bool
     assert created['initialpose'] is bridge.PoseWithCovarianceStamped
     assert created['cmd_vel_nav'] is bridge.Twist
     assert bridge.Twist.__name__ == 'Twist'  # geometry_msgs/Twist, NOT TwistStamped
@@ -745,7 +746,7 @@ def test_init_ros_io_never_creates_a_bare_cmd_vel_publisher():
     topics = [c.args[1] for c in node.create_publisher.call_args_list]
     assert 'cmd_vel' not in topics
     assert all(not t.lstrip('/').rstrip('/').endswith('/cmd_vel') for t in topics)
-    assert all(t == 'cmd_vel_nav' or t == 'initialpose' for t in topics)
+    assert all(t in ('cmd_vel_nav', 'initialpose', 'explore/resume') for t in topics)
 
 
 def test_init_ros_io_keeps_the_cmd_vel_nav_publisher_for_the_teleop():
@@ -6871,3 +6872,26 @@ def test_a_valid_map_after_an_invalid_one_is_published():
     node._on_map(_raw_map([0, 0, 0, 0]))
     node._broadcast_map()
     assert len(_published_map(node)) == 1 and node._map_version == 1
+
+
+def test_stop_pauses_the_exploration_with_a_false_resume(monkeypatch):
+    node = _io_node()
+    node._stop_teleop_only = mock.Mock()
+    node.cancel = mock.Mock()
+    node._stop_context = mock.Mock()
+    node._log_summarized = mock.Mock()
+    node.stop()
+    sent = node.created_publishers['explore/resume'].publish.call_args.args[0]
+    assert sent.data is False
+
+
+def test_stop_still_cancels_when_pausing_the_exploration_fails():
+    node = _io_node()
+    node._stop_teleop_only = mock.Mock()
+    node.cancel = mock.Mock()
+    node._stop_context = mock.Mock()
+    node._log_summarized = mock.Mock()
+    node.get_logger = mock.Mock()
+    node.created_publishers['explore/resume'].publish.side_effect = RuntimeError('boom')
+    node.stop()
+    node.cancel.assert_called_once()

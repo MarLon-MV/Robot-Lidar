@@ -17,6 +17,7 @@ EXPECTED = {
     'slam_toolbox.yaml': ['slam_toolbox'],
     'lidar.yaml': ['ldlidar_node'],
     'web.yaml': ['mtrb_web_bridge'],
+    'explore.yaml': ['explore_node'],
 }
 
 

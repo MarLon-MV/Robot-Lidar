@@ -11,6 +11,7 @@ __pycache__/
 
 # Third-party code: downloaded with `vcs import src < mtrb.repos` (see mtrb.repos)
 src/ldlidar_stl_ros2/
+src/m-explore-ros2/
 
 # Local parameter overrides for the web bridge (not a secret store: the auth token is never a
 # ROS parameter; it comes from MTRB_WEB_TOKEN or ~/.config/mtrb/web_token)

@@ -40,6 +40,7 @@
   <exec_depend>nav2_velocity_smoother</exec_depend>
   <exec_depend>nav2_lifecycle_manager</exec_depend>
   <exec_depend>nav2_costmap_2d</exec_depend>
+  <exec_depend>explore_lite</exec_depend>
 
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

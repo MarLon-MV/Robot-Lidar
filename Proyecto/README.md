@@ -333,7 +333,7 @@ ros2 launch mtrb_bringup mtrb.launch.py mode:=mapping posegraph:=<ruta/base> \
 
 Argumentos útiles: `namespace` (r2), `navigation` (false = solo localizar/mapear), `use_ekf`,
 `scan_topic`, `odom_topic`, `imu_topic`, `lidar` (false = sin driver), `lidar_port`, `lidar_frame`,
-`lidar_x/y/z/yaw`, `params_file`, `ekf_params_file`, `slam_params_file`, `lidar_params_file`, `use_sim_time`. Ver `ros2 launch mtrb_bringup mtrb.launch.py -s`.
+`lidar_x/y/z/yaw`, `explore` (apartado 2.0), `params_file`, `ekf_params_file`, `slam_params_file`, `lidar_params_file`, `use_sim_time`. Ver `ros2 launch mtrb_bringup mtrb.launch.py -s`.
 Sin `map:=` se busca `map/map.yaml` del paquete instalado.
 
 Guardar mapas (con `mode:=mapping` en marcha; el directorio debe existir):
@@ -347,6 +347,28 @@ Guarda ambos: `.yaml/.pgm` para `mode:=map` y `.posegraph/.data` para ampliar. S
 interfaz web (apartado 2.1), puedes guardar desde ahí; estos comandos quedan como alternativa.
 
 Visualización y control: desde la interfaz web (apartado 2.1). No se usa RViz.
+
+### 2.0 Exploración autónoma (explore_lite)
+
+Con `explore:=true` (solo en `mode:=mapping`, con Nav2) el robot **se mueve solo**: busca la frontera
+entre lo mapeado y lo desconocido, manda un objetivo a Nav2 y repite hasta cubrir el entorno. Al
+terminar vuelve al punto de partida (el dock). Usa [explore_lite](https://github.com/robo-friends/m-explore-ros2),
+que se baja con `vcs import src < mtrb.repos` (hay que compilar otra vez).
+
+```bash
+ros2 launch mtrb_bringup mtrb.launch.py mode:=mapping explore:=true web:=true
+# guarda el mapa cuando acabe (botón de la web o los comandos de arriba)
+```
+
+- **Parar:** el botón **PARAR** de la web pausa la exploración (publica `false` en
+  `/r2/explore/resume`) y cancela el objetivo. También: `ros2 topic pub --once /r2/explore/resume std_msgs/msg/Bool "{data: false}"`.
+  Para reanudar, el mismo comando con `true`.
+- **Estado:** `ros2 topic echo /r2/explore/status`. Las fronteras se ven en `/r2/explore/frontiers`.
+- Ajustes (`param/explore.yaml`): `planner_frequency`, `min_frontier_size`, `progress_timeout`, `return_to_init`.
+- **Seguridad:** va por Nav2, así que respeta sus límites de velocidad y evita obstáculos con el
+  LiDAR, pero el LiDAR de 2D no ve escalones ni objetos bajos. Pruébalo con el robot vigilado,
+  en una zona cerrada y sin escaleras, y con el botón PARAR a mano. Empieza explorando en cuanto
+  arranca el launch.
 
 ### 2.1 Interfaz web (sustituye a RViz)
 

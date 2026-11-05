@@ -10,6 +10,8 @@ mode:=mapping  slam_toolbox. Without posegraph the map origin is the robot's pos
                start (the dock). With posegraph the saved map is extended and the robot
                starts at the dock pose given by dock_x/dock_y/dock_yaw.
 
+explore:=true  (mapping only) explore_lite drives the robot to the unexplored frontiers by itself.
+
 Both modes also start the EKF and Nav2. Exactly one of AMCL / slam_toolbox runs, since
 both publish map -> odom. The Create 3 publishes odom -> base_link; nothing here does.
 
@@ -221,6 +223,17 @@ def _navigation(s, nav_params):
     return nodes + [_lifecycle_manager(s, 'lifecycle_manager_navigation', names)]
 
 
+def _explore(s):
+    """explore:=true -> explore_lite: frontier exploration on top of slam_toolbox + Nav2."""
+    if not is_true(s.get('explore')):
+        return []
+    if s.mode != 'mapping' or not is_true(s.get('navigation')):
+        raise RuntimeError(
+            "explore:=true needs mode:=mapping and navigation:=true (it sends goals to Nav2)")
+    return [_node(s, 'explore_lite', 'explore', 'explore_node',
+                  parameters=[_param_file(s, 'explore_params_file')])]
+
+
 def _web(s):
     """Web bridge (FastAPI + rclpy), only with web:=true. Dock pose comes from the launch."""
     if not s.web:
@@ -244,6 +257,7 @@ def _launch_setup(context):
     actions += _localization(s, nav_params) if s.mode == 'map' else _slam(s)
     if is_true(s.get('navigation')):
         actions += _navigation(s, nav_params)
+    actions += _explore(s)
     actions += _web(s)
     return actions
 
@@ -274,6 +288,11 @@ def generate_launch_description():
                         'empty = new map'),
         arg('navigation', default_value='true',
             description='Start Nav2 (false: map/localize only)'),
+
+        arg('explore', default_value='false',
+            description='mode:=mapping only: explore on its own (explore_lite). The robot MOVES '
+                        'by itself: supervise it. PARAR in the web stops it'),
+        arg('explore_params_file', default_value=param('explore.yaml')),
 
         arg('params_file', default_value=param('nav2.yaml')),
         arg('ekf_params_file', default_value=param('ekf.yaml')),

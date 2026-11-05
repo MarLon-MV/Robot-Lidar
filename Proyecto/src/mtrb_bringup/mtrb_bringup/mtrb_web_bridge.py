@@ -42,7 +42,7 @@ from rclpy.qos import (
 from rclpy.time import Time
 from sensor_msgs.msg import BatteryState, LaserScan
 from slam_toolbox.srv import SaveMap, SerializePoseGraph
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -468,6 +468,10 @@ class MtrbWebBridge(Node, NavPort, MapPort):
         # publishes on `cmd_vel` (only velocity_smoother does). Second allowed publisher
         # next to `initialpose`; commands come only from TeleopGate decisions.
         self._cmd_vel_nav_pub = self.create_publisher(Twist, 'cmd_vel_nav', 10)
+        # Autonomous exploration (explore_lite, explore:=true): STOP publishes False here so the
+        # explorer does not send a new goal right after the cancel. Relative -> /r2/explore/resume.
+        # It carries no velocity: it only ever pauses the explorer.
+        self._explore_resume_pub = self.create_publisher(Bool, 'explore/resume', 10)
         self.create_timer(NAV_WATCHDOG_PERIOD_S, self._nav_watchdog)
         # Own callback group: a slow callback of the default group (map encoding...) must not
         # delay the teleop watchdog.
@@ -1084,6 +1088,7 @@ class MtrbWebBridge(Node, NavPort, MapPort):
         """
         self._log_summarized('stop')
         self._stop_teleop_only()
+        self._pause_exploration()
         self._stop_context.active = True
         try:
             self.cancel()
@@ -1091,6 +1096,13 @@ class MtrbWebBridge(Node, NavPort, MapPort):
             self.get_logger().error(f'Cancel during stop failed: {err}')
         finally:
             self._stop_context.active = False
+
+    def _pause_exploration(self):
+        """Tell explore_lite to stop (no-op if it is not running); never raises."""
+        try:
+            self._explore_resume_pub.publish(Bool(data=False))
+        except Exception as err:  # noqa: B902
+            self.get_logger().error(f'Pausing the exploration failed: {err}')
 
     def _teleop_watchdog(self):
         """Periodic: zero Twist burst (once) when the controlling client went silent."""
