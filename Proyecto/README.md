@@ -68,7 +68,7 @@ solo que sin la interfaz.
 | Entender topics, namespaces y remapeos | apartado 3 |
 | Ejecutar las pruebas o contribuir | apartados 5 y 6 |
 | Saber qué falta por hacer | apartado 7 |
-| Diseño, decisiones y especificación | `../docs/` (`arquitectura.md`, `decisiones/`, `specs/`) |
+| Diseño, decisiones y especificación | No se publican en este repositorio (solo se incluye la carpeta `Proyecto/`) |
 
 ## Estructura del proyecto
 
@@ -118,7 +118,7 @@ Sigue los pasos en orden la primera vez. Después, en el día a día, solo neces
 ### 1.2 Clonar el repositorio
 
 El workspace de ROS 2 es la carpeta **`Proyecto/`** del repositorio (contiene `src/`, `env.sh`,
-`mtrb.repos` y `requirements-web.txt`); la raíz del repositorio también tiene `docs/` y `CLAUDE.md`.
+`mtrb.repos` y `requirements-web.txt`); la raíz del repositorio solo contiene esa carpeta.
 Todos los comandos de este README se ejecutan desde `Proyecto/`:
 
 ```bash
@@ -348,12 +348,12 @@ Visualización y control: desde la interfaz web (apartado 2.1). No se usa RViz.
 
 > **Estado:** implementada y probada en macOS (tests, análisis de seguridad y revisión de código),
 > pero **todavía no probada en el robot**. Antes de mover el robot con ella, sigue el
-> procedimiento de verificación física de la sección 2.1.7 y de `docs/specs/especificaciones.md`.
+> procedimiento de verificación física de la sección 2.1.7.
 
 Un nodo (`mtrb_web_bridge`) sirve una página web desde la Pi y la conecta con ROS 2: muestra el
 mapa, el robot, el LiDAR y la ruta en tiempo real, y permite enviar objetivos a Nav2, teleoperar,
 parar el robot y guardar mapas. Funciona desde cualquier navegador de la misma red (móvil o
-portátil), sin instalar nada. Diseño y decisiones: [`docs/decisiones/0001-web-bridge.md`](../docs/decisiones/0001-web-bridge.md).
+portátil), sin instalar nada.
 
 #### 2.1.1 Dependencias Python
 
@@ -488,7 +488,7 @@ admiten caracteres `A-Z a-z 0-9 _ . / -`). Cada guardado crea `<nombre>.yaml`, `
 #### 2.1.7 Primera prueba en el robot
 
 Hazla con el robot **con las ruedas en el aire**, en una zona despejada y con la parada física al
-alcance. Orden recomendado (detalle completo en `docs/specs/especificaciones.md`, sección 12):
+alcance. Orden recomendado:
 
 1. Entorno: `timedatectl` con NTP sincronizado. Lanza con `navigation:=true` (el valor por
    defecto): la teleop exige el `velocity_smoother`, que es quien convierte `cmd_vel_nav` en

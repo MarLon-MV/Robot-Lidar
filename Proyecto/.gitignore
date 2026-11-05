@@ -1,0 +1,17 @@
+# Colcon / Python artifacts
+build/
+install/
+log/
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# Third-party code: downloaded with `vcs import src < mtrb.repos` (see mtrb.repos)
+src/ldlidar_stl_ros2/
+
+# Local parameter overrides for the web bridge (not a secret store: the auth token is never a
+# ROS parameter; it comes from MTRB_WEB_TOKEN or ~/.config/mtrb/web_token)
+src/mtrb_bringup/param/web.local.yaml
