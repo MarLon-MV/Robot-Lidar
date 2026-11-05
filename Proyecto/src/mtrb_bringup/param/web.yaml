@@ -19,6 +19,7 @@ mtrb_web_bridge:
       max_vx: 0.2               # m/s     INITIAL: tune on the robot
       max_wz: 0.8               # rad/s   INITIAL: tune on the robot
       timeout_ms: 300           # ms without a teleop message -> zero Twist
+      enabled: true             # false -> every teleop message is refused (teleop_disabled)  INITIAL
     scan:
       max_points: 360
       min_range: 0.15           # m
