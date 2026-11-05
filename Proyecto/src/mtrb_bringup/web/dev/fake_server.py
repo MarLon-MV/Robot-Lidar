@@ -135,7 +135,8 @@ class AuthLimiter:
     def record_failure(self, ip):
         """Count one wrong token from `ip`; lock it when the limit is reached."""
         now = time.monotonic()
-        recent = [t for t in self.fails.get(ip, []) if now - t < AUTH_WINDOW_S] + [now]
+        recent = [t for t in self.fails.get(
+            ip, []) if now - t < AUTH_WINDOW_S] + [now]
         self.fails[ip] = recent
         if len(recent) >= AUTH_MAX_FAILS:
             self.locked[ip] = now + AUTH_LOCK_S
@@ -173,12 +174,15 @@ def handle_client(raw, conn, nav, fail, outbox):
         if not (_num(data.get('vx')) and _num(data.get('wz'))
                 and isinstance(seq, int) and not isinstance(seq, bool)):
             log('WS teleop INVALID', raw[:80])
-            outbox.append({'type': 'error', 'code': 'invalid_teleop', 'detail': 'Bad teleop'})
+            outbox.append(
+                {'type': 'error', 'code': 'invalid_teleop', 'detail': 'Bad teleop'})
         elif fail == 'teleop' or nav['state'] == 'active':
             log('WS teleop REJECTED seq=%s' % seq)
-            outbox.append({'type': 'error', 'code': 'teleop_rejected', 'detail': 'Rejected'})
+            outbox.append(
+                {'type': 'error', 'code': 'teleop_rejected', 'detail': 'Rejected'})
         elif seq <= conn['seq']:
-            log('WS teleop DROPPED old/repeated seq=%d (last %d)' % (seq, conn['seq']))
+            log('WS teleop DROPPED old/repeated seq=%d (last %d)' %
+                (seq, conn['seq']))
         elif now - conn['t'] < 1.0 / MAX_RATE_HZ:
             log('WS teleop DROPPED rate seq=%d' % seq)
         else:
@@ -189,7 +193,8 @@ def handle_client(raw, conn, nav, fail, outbox):
                 seq, vx, wz, ' (saturated)' if (vx, wz) != (data['vx'], data['wz']) else ''))
     else:
         log('WS unsupported', raw[:80])
-        outbox.append({'type': 'error', 'code': 'unsupported_message', 'detail': 'Unsupported'})
+        outbox.append(
+            {'type': 'error', 'code': 'unsupported_message', 'detail': 'Unsupported'})
 
 
 def create_app(token, mode='mapping', fail='none', with_dock=True, maps=None,
@@ -219,7 +224,8 @@ def create_app(token, mode='mapping', fail='none', with_dock=True, maps=None,
         return handler
 
     for route, (name, media) in STATIC.items():
-        app.add_api_route(route, serve(name, media), methods=['GET'], include_in_schema=False)
+        app.add_api_route(route, serve(name, media), methods=[
+                          'GET'], include_in_schema=False)
 
     def guard(request):
         """Return an error response for a locked IP or a bad token, else None."""
@@ -385,7 +391,8 @@ def create_app(token, mode='mapping', fail='none', with_dock=True, maps=None,
             [-3 + 0.1 * k, -2 + 0.04 * k] for k in range(60)]})
         t0 = time.time()
         tick = 0
-        conn = {'seq': 0, 't': 0.0}   # per-connection teleop state (seq restarts here)
+        # per-connection teleop state (seq restarts here)
+        conn = {'seq': 0, 't': 0.0}
         outbox = []
 
         async def receive():
@@ -405,7 +412,8 @@ def create_app(token, mode='mapping', fail='none', with_dock=True, maps=None,
                     await websocket.send_json(outbox.pop(0))
                 t = time.time() - t0
                 x, y = 2.0 * math.cos(0.3 * t), 1.5 * math.sin(0.3 * t)
-                yaw = math.atan2(1.5 * math.cos(0.3 * t), -2.0 * math.sin(0.3 * t))
+                yaw = math.atan2(1.5 * math.cos(0.3 * t), -
+                                 2.0 * math.sin(0.3 * t))
                 await websocket.send_json({'type': 'pose', 'x': x, 'y': y, 'yaw': yaw,
                                            'stamp': time.time()})
                 if tick % 2 == 0:
@@ -413,7 +421,8 @@ def create_app(token, mode='mapping', fail='none', with_dock=True, maps=None,
                     for k in range(180):
                         a = yaw + (k / 180.0) * 2 * math.pi
                         r = 2.5 + 0.3 * math.sin(3 * a)
-                        pts += [round(x + r * math.cos(a), 3), round(y + r * math.sin(a), 3)]
+                        pts += [round(x + r * math.cos(a), 3),
+                                round(y + r * math.sin(a), 3)]
                     await websocket.send_json({'type': 'scan', 'stamp': time.time(),
                                                'points': pts})
                 if tick % 10 == 0:
@@ -428,7 +437,8 @@ def create_app(token, mode='mapping', fail='none', with_dock=True, maps=None,
                     await websocket.send_json(status)
                 if tick % 5 == 0:
                     if nav['state'] == 'active':
-                        nav['distance'] = round(max(0.0, nav['distance'] - 0.25), 2)
+                        nav['distance'] = round(
+                            max(0.0, nav['distance'] - 0.25), 2)
                         if nav['distance'] == 0.0:
                             nav.update(state='succeeded', distance=None)
                     await websocket.send_json({'type': 'nav', 'state': nav['state'],
@@ -449,17 +459,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8080)
     parser.add_argument('--token', default='dev-token')
-    parser.add_argument('--mode', choices=('map', 'mapping'), default='mapping')
+    parser.add_argument(
+        '--mode', choices=('map', 'mapping'), default='mapping')
     parser.add_argument(
         '--fail', choices=('none', 'teleop') + tuple(FAILURES) + SAVE_FAILS + tuple(INIT_FAILS)
         + ('stop503',),
         default='none')
     parser.add_argument('--no-dock', action='store_true')
-    parser.add_argument('--maps', default='lab,casa', help='comma separated saved map names')
+    parser.add_argument('--maps', default='lab,casa',
+                        help='comma separated saved map names')
     parser.add_argument('--no-posegraph', action='store_true')
     parser.add_argument('--stale', action='store_true')
     args = parser.parse_args()
-    print('Fake MTRB server on http://127.0.0.1:%d  token=%s' % (args.port, args.token))
+    print('Fake MTRB server on http://127.0.0.1:%d  token=%s' %
+          (args.port, args.token))
     maps = [m for m in args.maps.split(',') if m]
     app = create_app(args.token, args.mode, args.fail, not args.no_dock, maps,
                      not args.no_posegraph, args.stale)
