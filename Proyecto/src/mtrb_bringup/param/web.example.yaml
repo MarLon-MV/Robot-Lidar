@@ -1,13 +1,15 @@
 # Web bridge (FastAPI + rclpy): serves the web UI and the REST/WebSocket API.
-# Copy to web.local.yaml and set a real token (that file is git-ignored).
-# LAN only: do not expose this port to the internet.
-# The node refuses to start with the example token or a token shorter than 16 characters.
-# No TLS here: the token travels in clear text; use an isolated network or a TLS reverse proxy.
-# Token priority (first non-empty wins):
+# Copy to web.local.yaml to override parameters (git-ignored). It never holds a token.
+# The token is read ONLY from (first non-empty wins):
 #   1. environment variable MTRB_WEB_TOKEN
-#   2. parameter auth.token loaded by the launch (web_params_file)
-#   3. param/web.local.yaml, then param/web.yaml in the installed share (last resort)
-# Quote numeric tokens in YAML (token: "123456"); they are converted to str anyway.
+#   2. the file auth.token_file (default ~/.config/mtrb/web_token): a REGULAR file (no
+#      symlink) owned by the user running the node, mode 0600 (no group/other access).
+#      Create it with: install -m 600 /dev/null ~/.config/mtrb/web_token, then write a random
+#      token (e.g. `openssl rand -base64 24`) into it. It is read once and never logged.
+# The node refuses to start without a token, with a placeholder (CHANGE-ME...), a blank one,
+# one made of a single repeated character, or one shorter than 20 characters.
+# LAN only: do not expose this port to the internet.
+# No TLS here: the token travels in clear text; use an isolated network or a TLS reverse proxy.
 mtrb_web_bridge:
   ros__parameters:
     host: 0.0.0.0
@@ -43,10 +45,11 @@ mtrb_web_bridge:
     limits:
       max_clients: 5
       max_ws_bytes: 4096
+      max_connections: 64       # uvicorn limit_concurrency (HTTP + WebSocket), 1 .. 1024
     auth:
-      token: CHANGE-ME-example-token   # placeholder: the node REFUSES to start with it
+      token_file: ~/.config/mtrb/web_token   # PATH of the private token file (not the token)
       allow_example_token: false       # development only: accept the placeholder or a token
-                                       # shorter than 16 chars, loopback host only (127.0.0.1,
+                                       # shorter than 20 chars, loopback host only (127.0.0.1,
                                        # ::1, localhost). Never set it to true on the robot.
     dock:                       # overridden by the launch file (dock_x/dock_y/dock_yaw)
       x: 0.0                    # m

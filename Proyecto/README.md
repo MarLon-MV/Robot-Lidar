@@ -13,10 +13,17 @@ src/
 └── mtrb_bringup/
     ├── launch/mtrb.launch.py    # único launch, mode:=map|mapping; una función por subsistema
     ├── param/{nav2,ekf,slam_toolbox,lidar}.yaml
+    ├── param/{web,web.example}.yaml             # puente web (token de ejemplo; el real va aparte)
     ├── map/
     ├── mtrb_bringup/utils.py                    # helpers puros (sin ROS), compartidos y testeados
     ├── mtrb_bringup/initial_pose_publisher.py   # publica la pose del dock en /r2/initialpose
+    ├── mtrb_bringup/mtrb_web_bridge.py          # nodo ROS 2 del puente web (goals, teleop, mapas)
+    ├── mtrb_bringup/web_server.py               # FastAPI: REST + WebSocket (sin imports de ROS)
+    ├── mtrb_bringup/web_utils.py                # lógica pura del puente: validación, teleop, rutas
+    ├── web/                     # interfaz: index.html, app.js, style.css (sin build ni CDN)
+    │   └── dev/fake_server.py   # servidor falso para desarrollar la UI sin el robot
     └── test/                    # unitarias, integración y lint
+requirements-web.txt             # dependencias Python del puente web (fastapi, uvicorn)
 env.sh
 mtrb.repos                       # código de terceros (driver ldlidar_stl_ros2) → vcs import
 ```
@@ -42,13 +49,14 @@ Sigue los pasos en orden la primera vez. Después, en el día a día, solo neces
 
 ### 1.2 Clonar el repositorio
 
-La raíz del repositorio **es** el workspace de ROS 2 (contiene `src/`), así que se clona
-directamente con el nombre que quieras darle al workspace:
+El workspace de ROS 2 es la carpeta **`Proyecto/`** del repositorio (contiene `src/`, `env.sh`,
+`mtrb.repos` y `requirements-web.txt`); la raíz del repositorio también tiene `docs/` y `CLAUDE.md`.
+Todos los comandos de este README se ejecutan desde `Proyecto/`:
 
 ```bash
 sudo apt install -y git
-git clone https://github.com/MarLon-MV/Robot-SLAM.git ~/mtrb_ws
-cd ~/mtrb_ws
+git clone https://github.com/MarLon-MV/Robot-Lidar.git ~/Robot-Lidar
+cd ~/Robot-Lidar/Proyecto
 
 # Driver del LD19 (ldlidar_stl_ros2), que no está en apt: se descarga dentro de src/
 sudo apt install -y python3-vcstool
@@ -58,7 +66,7 @@ vcs import src < mtrb.repos
 [mtrb.repos](mtrb.repos) lista el código de terceros que se compila en el workspace. La carpeta
 `src/ldlidar_stl_ros2/` está en `.gitignore`: no se sube a este repositorio.
 
-Para actualizar más adelante: `cd ~/mtrb_ws && git pull && vcs pull src` y vuelve a compilar
+Para actualizar más adelante: `cd ~/Robot-Lidar/Proyecto && git pull && vcs pull src` y vuelve a compilar
 (paso 1.5).
 
 ### 1.3 Instalar las dependencias
@@ -72,7 +80,7 @@ sudo rosdep init
 rosdep update
 
 # Dependencias del proyecto (Nav2, slam_toolbox, robot_localization, xacro, CycloneDDS…)
-cd ~/mtrb_ws
+cd ~/Robot-Lidar/Proyecto
 rosdep install --from-paths src --ignore-src -r -y
 ```
 
@@ -107,7 +115,7 @@ Si cambias el namespace o el dominio, cámbialos también aquí: `namespace:=` e
 ### 1.5 Compilar
 
 ```bash
-cd ~/mtrb_ws
+cd ~/Robot-Lidar/Proyecto
 source /opt/ros/jazzy/setup.bash
 colcon build --symlink-install
 ```
@@ -118,7 +126,7 @@ Recompila si añades archivos nuevos o tocas `setup.py`, `package.xml` o `CMakeL
 ### 1.6 Cargar el entorno (en cada terminal)
 
 ```bash
-cd ~/mtrb_ws
+cd ~/Robot-Lidar/Proyecto
 source env.sh
 ```
 
@@ -126,7 +134,7 @@ source env.sh
 y el workspace. Sin esto la Pi no ve al robot. Para no tener que escribirlo cada vez:
 
 ```bash
-echo 'source ~/mtrb_ws/env.sh' >> ~/.bashrc
+echo 'source ~/Robot-Lidar/Proyecto/env.sh' >> ~/.bashrc
 ```
 
 ### 1.7 Comprobar la conexión con el robot
@@ -215,13 +223,24 @@ Si prefieres lanzar el driver por tu cuenta, pasa `lidar:=false`. Tu driver debe
 En el Mac no hace falta ROS para editar y pasar las pruebas que no dependen de él:
 
 ```bash
-git clone <URL-del-repositorio> mtrb_ws && cd mtrb_ws
+git clone https://github.com/MarLon-MV/Robot-Lidar.git ~/Robot-Lidar
+cd ~/Robot-Lidar/Proyecto          # el workspace es Proyecto/, no la raíz del repositorio
 python3 -m venv .venv && source .venv/bin/activate
-pip install pytest pyyaml flake8
+pip install pytest pyyaml flake8 flake8-import-order flake8-docstrings
 pytest src/mtrb_bringup/test/test_utils.py src/mtrb_bringup/test/test_params.py
 ```
 
-Las demás pruebas (`colcon test`) se corren en la Pi.
+Para las pruebas del puente web (sin ROS) instala además `pip install -r requirements-web.txt`
+(incluye `httpx`, que usan los tests). Las pruebas del nodo (`test_web_bridge.py`) y del launch
+necesitan `rclpy`: en el Mac se saltan, y las demás pruebas (`colcon test`) se corren en la Pi.
+Ejecútalas desde la carpeta del paquete (si no, falla el import y `flake8` ignora `setup.cfg`):
+
+```bash
+cd src/mtrb_bringup
+python -m pytest -q test/ --ignore=test/test_flake8.py --ignore=test/test_pep257.py
+python -m flake8 .
+node --check web/app.js     # si tienes Node
+```
 
 ## 2. Lanzar
 
@@ -252,9 +271,197 @@ ros2 service call /r2/slam_toolbox/save_map slam_toolbox/srv/SaveMap "{name: {da
 ros2 service call /r2/slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph "{filename: '<ruta/base>'}"
 ```
 
-Guarda ambos: `.yaml/.pgm` para `mode:=map` y `.posegraph/.data` para ampliar.
+Guarda ambos: `.yaml/.pgm` para `mode:=map` y `.posegraph/.data` para ampliar. Si usas la
+interfaz web (apartado 2.1), puedes guardar desde ahí; estos comandos quedan como alternativa.
 
-Visualización: se hará desde una interfaz web (pendiente). No se usa RViz.
+Visualización y control: desde la interfaz web (apartado 2.1). No se usa RViz.
+
+### 2.1 Interfaz web (sustituye a RViz)
+
+> **Estado:** implementada y probada en macOS (tests, análisis de seguridad y revisión de código),
+> pero **todavía no probada en el robot**. Antes de mover el robot con ella, sigue el
+> procedimiento de verificación física de la sección 2.1.7 y de `docs/specs/especificaciones.md`.
+
+Un nodo (`mtrb_web_bridge`) sirve una página web desde la Pi y la conecta con ROS 2: muestra el
+mapa, el robot, el LiDAR y la ruta en tiempo real, y permite enviar objetivos a Nav2, teleoperar,
+parar el robot y guardar mapas. Funciona desde cualquier navegador de la misma red (móvil o
+portátil), sin instalar nada. Diseño y decisiones: [`docs/decisiones/0001-web-bridge.md`](../docs/decisiones/0001-web-bridge.md).
+
+#### 2.1.1 Dependencias Python
+
+El puente usa FastAPI y uvicorn, que no vienen con ROS. La lista está en
+[requirements-web.txt](requirements-web.txt). En Ubuntu 24.04 `pip` no deja instalar en el
+Python del sistema, así que usa un entorno virtual que vea los paquetes de ROS:
+
+```bash
+python3 -m venv --system-site-packages ~/mtrb_venv
+~/mtrb_venv/bin/pip install -r ~/Robot-Lidar/Proyecto/requirements-web.txt
+```
+
+`httpx` del mismo archivo solo hace falta para las pruebas. Para que `ros2 launch` encuentre
+esos paquetes, añade el entorno virtual al `PYTHONPATH` antes de lanzar (comprueba la versión
+de Python de la ruta con `ls ~/mtrb_venv/lib`):
+
+```bash
+export PYTHONPATH=~/mtrb_venv/lib/python3.12/site-packages:$PYTHONPATH
+```
+
+*Pendiente de verificar en la Pi:* esta combinación (entorno virtual + `ros2 launch`) no se ha
+probado todavía.
+
+#### 2.1.2 Token (obligatorio)
+
+El acceso exige un token. **El nodo se niega a arrancar** si no hay token, si es el marcador de
+ejemplo (`CHANGE-ME…`), si tiene **menos de 20 caracteres**, si está en blanco o si es un solo
+carácter repetido. Genera uno (`token_urlsafe(24)` da 32 caracteres):
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(24))"
+```
+
+El token **no es un parámetro de ROS** (cualquier equipo del dominio 21 lo leería con
+`ros2 param get`) y no está en ningún YAML. Se lee de una de estas dos fuentes; gana la primera
+que tenga valor:
+
+1. La variable de entorno `MTRB_WEB_TOKEN`:
+
+   ```bash
+   export MTRB_WEB_TOKEN='<el-token-generado>'
+   ```
+
+2. Un archivo privado, por defecto `~/.config/mtrb/web_token` (cámbialo con el parámetro
+   `auth.token_file`, ruta absoluta o que empiece por `~/`):
+
+   ```bash
+   mkdir -p ~/.config/mtrb
+   install -m 600 /dev/null ~/.config/mtrb/web_token
+   python3 -c "import secrets; print(secrets.token_urlsafe(24))" > ~/.config/mtrb/web_token
+   ```
+
+   El nodo exige que sea un archivo **normal** (no un enlace simbólico), **tuyo** y con permisos
+   `600` (sin acceso para grupo ni otros); si no, no arranca. No supera 1 KB, se lee una vez y
+   nunca se escribe en los logs.
+
+`param/web.local.yaml` ya no sirve para el token: solo para sobrescribir otros parámetros, y hay
+que recompilar para que el launch lo vea (lee la carpeta `param/` *instalada*).
+
+#### 2.1.3 Lanzar y abrir
+
+```bash
+ros2 launch mtrb_bringup mtrb.launch.py mode:=mapping web:=true
+# o, sobre un mapa existente:
+ros2 launch mtrb_bringup mtrb.launch.py mode:=map map:=/home/<usuario>/mtrb_maps/<nombre>.yaml web:=true
+```
+
+Abre `http://<ip-de-la-pi>:8080` (cambia el puerto con `web_port:=`; rango 1024–65535) e introduce
+el token. Sin `web:=true` el puente no arranca (es el valor por defecto).
+
+#### 2.1.4 Qué puedes hacer
+
+| Función | Cómo |
+| --- | --- |
+| Ver mapa, robot, LiDAR, ruta | Zoom con rueda o pellizco, arrastrar para desplazar, «Centrar en robot», capas conmutables |
+| Enviar un objetivo (Nav2) | Toca el mapa, arrastra para elegir la orientación y pulsa «Confirmar objetivo». Nunca se envía sin confirmar |
+| Cancelar / volver al dock | «Cancelar navegación» y «Volver al dock» (este pide confirmación) |
+| Pose inicial | Solo con `mode:=map`: toca, orienta y confirma |
+| Teleoperar | Activa «Activar teleoperación» (desactivada por defecto); joystick o teclas WASD / flechas. Límites: 0,2 m/s y 0,8 rad/s |
+| **PARAR** | Barra roja fija abajo, sin confirmación. También la tecla **Escape**; **Espacio** solo si el foco no está en un control |
+| Guardar mapa | Solo con `mode:=mapping`: escribe un nombre y pulsa «Guardar mapa» |
+| Estado | Modo, batería, estado de los nodos de Nav2, edad de scan y odom, conexión |
+
+Reglas que conviene conocer:
+
+- La teleop se **rechaza** si hay un objetivo de Nav2 activo, y un solo navegador puede conducir a la vez.
+- Si el navegador deja de enviar, a los 300 ms el robot recibe velocidad cero. Cerrar la pestaña o
+  cortar la Wi-Fi también lo detiene.
+- «Cancelar navegación» y PARAR cancelan **todos** los objetivos de `navigate_to_pose`, también los
+  que hayas lanzado desde otra herramienta (RViz, línea de comandos).
+- Tras un objetivo fallido, la web muestra «Fallido» y puede seguir bloqueando la teleop hasta que
+  termine otro objetivo (limitación conocida, ver el apartado 7).
+
+#### 2.1.5 Mapas guardados
+
+Se guardan en `~/mtrb_maps` (cámbialo con el parámetro `map_dir` de `param/web.yaml`; solo se
+admiten caracteres `A-Z a-z 0-9 _ . / -`). Cada guardado crea `<nombre>.yaml`, `<nombre>.pgm`,
+`<nombre>.posegraph` y `<nombre>.data`.
+
+- Nombres: letras, números, `_` y `-` (máx. 40), sin empezar por `-`. El nombre `map` está
+  reservado (es el mapa por defecto de `mode:=map`).
+- Si el nombre ya existe, la web pide confirmación antes de sobrescribir. Si responde
+  `backup_pending`, hay un respaldo anterior sin resolver: revisa o borra `<nombre>.*.bak` en
+  `~/mtrb_maps`.
+- Límites: 200 mapas, 200 MB libres como mínimo y 5 s entre guardados.
+- **Cargar** un mapa: `mode:=map map:=/home/<usuario>/mtrb_maps/<nombre>.yaml` (ruta absoluta).
+- **Ampliar** un mapa (con el robot en el dock): `mode:=mapping posegraph:=/home/<usuario>/mtrb_maps/<nombre> dock_x:=… dock_y:=… dock_yaw:=…`
+  (sin extensión). Si el guardado avisa de que no se guardó el posegraph, ese mapa no se podrá ampliar.
+- Guardar antes de que `slam_toolbox` haya publicado un mapa falla (`500 save_failed`).
+
+#### 2.1.6 Seguridad
+
+- **Solo red local, sin cifrado (HTTP, sin TLS).** El token viaja en claro. Usa una red dedicada o
+  aislada para el robot y **no expongas el puerto a internet**.
+- **Intentos de token:** tras 10 fallos desde una misma IP en 60 s, esa IP queda bloqueada 60 s
+  (error 429; el WebSocket no se abre). Una parada (`/api/stop`) con token válido siempre pasa.
+  El bloqueo usa la IP del socket: detrás de un proxy inverso todos los clientes compartirían IP.
+- **Conexiones:** el servidor limita las conexiones simultáneas (`limits.max_connections`), pero
+  uvicorn no tiene un tiempo máximo para cabeceras enviadas con lentitud. Si la red no es de
+  confianza, limita las conexiones por IP al puerto 8080 con un cortafuegos (por ejemplo,
+  `nftables` con `ct count`) y sube `ulimit -n`.
+- **Logs:** ROS escribe en `~/.ros/log` sin rotación; vigila el espacio de la tarjeta SD y limpia
+  los logs antiguos de vez en cuando.
+- **La web no es el freno de emergencia.** Ten siempre a mano la parada física del Create 3. Como
+  respaldo independiente de la web:
+  `ros2 service call /r2/navigate_to_pose/_action/cancel_goal action_msgs/srv/CancelGoal "{}"`.
+- Al apagar con Ctrl-C no se garantiza que el puente alcance a publicar velocidad cero. Detén el
+  robot antes de apagar el launch.
+- El dominio ROS 2 (21) no tiene autenticación: cualquier equipo de esa red puede llamar a los
+  servicios de ROS directamente, sin pasar por la web.
+
+#### 2.1.7 Primera prueba en el robot
+
+Hazla con el robot **con las ruedas en el aire**, en una zona despejada y con la parada física al
+alcance. Orden recomendado (detalle completo en `docs/specs/especificaciones.md`, sección 12):
+
+1. Entorno: `timedatectl` con NTP sincronizado. Lanza con `navigation:=true` (el valor por
+   defecto): la teleop exige el `velocity_smoother`, que es quien convierte `cmd_vel_nav` en
+   `cmd_vel`; sin él nadie mueve el robot desde la web. Comprueba en **el suavizador** (es el nodo
+   que importa para la parada):
+   `ros2 param get /r2/velocity_smoother use_sim_time` → `False`,
+   `ros2 param get /r2/velocity_smoother velocity_timeout` → `1.0` y
+   `ros2 param get /r2/velocity_smoother enable_stamped_cmd_vel` → `False`.
+   El puente (`/r2/mtrb_web_bridge`) y `/r2/bt_navigator` también deben dar `use_sim_time` `False`.
+2. Grafo: `ros2 topic info -v /r2/cmd_vel_nav` (tipo `geometry_msgs/msg/Twist`) y
+   `ros2 topic info -v /r2/cmd_vel` (su único publicador debe ser `velocity_smoother`).
+3. Cancelación a mano: con el servicio de la sección 2.1.6, sin objetivos debe responder
+   `return_code: 0`; con un objetivo lanzado por línea de comandos debe cancelarlo y `/r2/cmd_vel`
+   debe caer a cero. Hazlo **antes** de fiarte del botón de la web.
+4. Teleop: monitoriza `ros2 topic echo /r2/cmd_vel_nav` y `/r2/cmd_vel`. Al soltar el control debe
+   llegar un cero y, a unos 300 ms, una ráfaga de ceros; después silencio.
+5. PARAR, cerrar la pestaña y cortar la Wi-Fi mientras conduces: el robot debe detenerse. Mide
+   cuánto tarda en parar (objetivo: menos de 500 ms).
+6. Objetivo activo: la teleop debe rechazarse.
+7. `kill -9` del puente con la teleop mantenida: el robot debe parar por el `velocity_timeout` del
+   suavizador (1 s, con rampa de deceleración). Si no para, usa la parada física.
+8. Solo después de todo lo anterior, prueba con las ruedas en el suelo.
+
+#### 2.1.8 Parámetros
+
+Todos en `param/web.yaml` (el token real, aparte; ver 2.1.2). Los valores de teleop están marcados
+`INITIAL`: ajústalos en el robot.
+
+| Parámetro | Por defecto | Notas |
+| --- | --- | --- |
+| `host`, `port` | `0.0.0.0`, `8080` | `web_port:=` en el launch tiene prioridad |
+| `teleop.max_vx`, `teleop.max_wz` | `0.2`, `0.8` | Techos duros: 0,46 m/s y 1,9 rad/s |
+| `teleop.timeout_ms` | `300` | Entre 50 y 1000 |
+| `teleop.enabled` | `true` | `false` rechaza toda la teleop |
+| `rates.pose/scan/status` | `10 / 5 / 1` Hz | Baja `scan` a 2 Hz si la Pi va justa |
+| `limits.max_clients` | `5` | Navegadores simultáneos |
+| `limits.max_connections` | `64` | Conexiones HTTP y WebSocket simultáneas (1–1024) |
+| `map_dir` | `''` (`~/mtrb_maps`) | Ver 2.1.5 |
+| `maps.min_free_mb`, `maps.min_interval_s` | `200`, `5.0` | `0` desactiva el intervalo |
+| `auth.token_file` | `~/.config/mtrb/web_token` | Ruta del archivo del token (no el token); ver 2.1.2 |
+| `auth.allow_example_token` | `false` | Solo desarrollo, y solo con host `127.0.0.1` o `localhost` |
 
 ## 3. Namespace y remapeos
 
@@ -268,7 +475,10 @@ Todos los nodos van en `/r2`. Los topics relativos se resuelven bajo `/r2`.
 | controller_server, behavior_server | `cmd_vel → cmd_vel_nav` | |
 | velocity_smoother | `cmd_vel → cmd_vel_nav`, `cmd_vel_smoothed → cmd_vel` | salida final `/r2/cmd_vel` (`Twist`) |
 | Nav2 / AMCL / slam_toolbox | `scan_topic` (parámetro, no remap) | `/r2/scan` por defecto |
+| mtrb_web_bridge (solo con `web:=true`) | solo los de TF | publica `cmd_vel_nav` e `initialpose`; lee `map`, `scan`, `plan`, `battery_state`, `odom` y TF; usa `navigate_to_pose`, `slam_toolbox/save_map` y `serialize_map`, `<nodo>/get_state` y `navigate_to_pose/_action/cancel_goal` |
 
+- **Regla de la teleop:** la web publica velocidades **solo** en `/r2/cmd_vel_nav` (la entrada del
+  `velocity_smoother`), nunca en `/r2/cmd_vel`, que solo publica `velocity_smoother`.
 - `odom → base_link` lo publica el Create 3. El EKF corre con `publish_tf: false` (dos publicadores
   romperían el árbol TF); su `/r2/odometry/filtered` la usan controller, bt_navigator y velocity_smoother.
   AMCL y los costmaps usan el TF crudo del robot.
@@ -297,6 +507,12 @@ colcon test && colcon test-result --verbose
 - `mtrb_bringup/test/`: `test_utils.py` y `test_initial_pose.py` (unitarias), `test_params.py`
   (cada nodo del launch tiene su sección en el YAML), `test_launch.py` (argumentos públicos),
   `test_flake8.py` y `test_pep257.py` (estilo).
+- Puente web: `test_web_utils.py`, `test_teleop_gate.py`, `test_map_saver.py`, `test_web_hub.py`,
+  `test_web_server.py` (sin ROS; necesitan `fastapi` y `httpx`), `test_web_bridge.py` (nodo; necesita
+  `rclpy`, se salta en el Mac) y `test_web_frontend_static.py` (comprueba que la UI no usa
+  `innerHTML`, `eval` ni scripts o estilos en línea, compatibles con la CSP del servidor).
+  `bench_web.py` no es una prueba: mide el coste de la codificación del mapa y del reparto de
+  mensajes (ver `test/BENCHMARKS.md`, con el procedimiento para medir la CPU en la Pi).
 - `mtrb_description/test/test_urdf.py`: el xacro genera los frames esperados y nada de simulación.
 - Estilo: el de ROS 2 (`ament_flake8`, líneas de 99, config en `mtrb_bringup/setup.cfg`).
   `test_utils.py` y `test_params.py` corren también sin ROS: `pytest src/mtrb_bringup/test`.
@@ -309,11 +525,27 @@ colcon test && colcon test-result --verbose
 3. Nodo nuevo → archivo propio en `mtrb_bringup/`, entrada en `setup.py`, dependencias en
    `package.xml`, y su sección en el YAML (añádela a `test_params.py`).
 4. Antes de subir: `colcon test` sin fallos.
+5. Web: la lógica de decisión (validación, teleop, rutas de mapas) va en `web_utils.py` /
+   `web_server.py` sin imports de ROS y con su test; el nodo solo ejecuta. La UI (`web/`) no usa
+   build ni CDN, ni `innerHTML`, `eval` ni scripts o estilos en línea (la CSP los bloquearía).
+   Todo lo que mueva el robot o escriba en disco necesita tests y revisión de seguridad.
 
 ## 7. TODO
 
 `grep -rn TODO src/`: medir la posición real del LiDAR (`lidar_x/y/z`) y ponerla por defecto en el
-launch, ajustar inflación y velocidades.
+launch (la altura del plano de escaneo figura como `0.0298` en un comentario del launch y como
+`0.0245` en `lidar.urdf.xacro`: unifícala al medirla; la posición x/y es la que importa para que el
+scan encaje con el mapa), ajustar inflación y velocidades.
+
+Web (pendiente de probar en el robot, ver 2.1.7):
+
+- Medir la parada (objetivo: menos de 500 ms), la CPU de la Pi con el mapeo en marcha y la
+  latencia de pose y mapa (`test/BENCHMARKS.md`).
+- Confirmar los techos de velocidad del Create 3 (0,46 m/s y 1,9 rad/s son valores asumidos).
+- Comprobar que guardar, cargar y ampliar mapas funciona de extremo a extremo.
+- Limitación conocida: tras un objetivo fallido, el estado «Fallido» puede bloquear la teleop hasta
+  que termine otro objetivo.
+- Verificar la instalación de `fastapi`/`uvicorn` en un entorno virtual con `ros2 launch`.
 
 ## 8. Fuentes
 

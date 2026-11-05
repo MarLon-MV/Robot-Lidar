@@ -5,6 +5,7 @@ The ROS node writes into a `StateStore`; HTTP handlers only read snapshots of it
 """
 
 import asyncio
+import collections
 import copy
 import hmac
 import itertools
@@ -12,8 +13,10 @@ import json
 import math
 import os
 import shutil
+import stat
 import threading
 import time
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
@@ -22,18 +25,26 @@ from mtrb_bringup.web_utils import (
     MapPathError, POSEGRAPH_EXTS, posegraph_saved, ReservedMapNameError, resolve_map_base,
     valid_map_name, validate_goal)
 from starlette.websockets import WebSocketState
-import yaml
 
-NODE_SECTION = 'mtrb_web_bridge'
 TOKEN_ENV_VAR = 'MTRB_WEB_TOKEN'
-LOCAL_PARAM_FILE = 'web.local.yaml'
-DEFAULT_PARAM_FILE = 'web.yaml'
+DEFAULT_TOKEN_FILE = '~/.config/mtrb/web_token'
+TOKEN_FILE_MAX_BYTES = 1024         # a token file bigger than this is refused
+TOKEN_MIN_LENGTH = 20               # characters
+TOKEN_FILE_FORBIDDEN_MODE = 0o077   # any group/other permission bit refuses the file
 PLACEHOLDER_TOKEN_PREFIX = 'CHANGE-ME'
+# Brute-force protection (per client IP, only the failed-token path feeds it).
+AUTH_MAX_FAILURES = 10              # failed tokens tolerated inside AUTH_WINDOW_S
+AUTH_WINDOW_S = 60.0
+AUTH_BLOCK_S = 60.0                 # time an IP stays blocked after AUTH_MAX_FAILURES
+AUTH_MAX_TRACKED_IPS = 1024         # bound of the failure table (memory)
+AUTH_UNKNOWN_CLIENT = 'unknown'
+EVENT_SUMMARY_PERIOD_S = 1.0        # at most one summarized log line per period
+AUTH_LOG_PERIOD_S = 5.0
 STATIC_FILES = {'/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css'}
 STATIC_MEDIA_TYPES = {'/': 'text/html', '/app.js': 'text/javascript', '/style.css': 'text/css'}
 
 WS_PATH = '/ws'
-WS_CLOSE_UNAUTHORIZED = 1008  # policy violation (only reachable after accept)
+WS_CLOSE_UNAUTHORIZED = 1008  # policy violation; ONLY before accept (browser sees 1006)
 WS_CLOSE_TOO_BIG = 1009
 WS_CLOSE_TRY_AGAIN_LATER = 1013  # too many clients
 WS_CLOSE_INTERNAL_ERROR = 1011
@@ -152,7 +163,12 @@ class NavPort:
         raise NotImplementedError
 
     def publish_initial_pose(self, x_m, y_m, yaw_rad):
-        """Publish the pose estimate (frame `map`) on `initialpose`."""
+        """
+        Publish the pose estimate (frame `map`) on `initialpose`.
+
+        Raise NavBusyError if a goal, an unconfirmed goal, a pending cancel-all or a teleop
+        command may be moving the robot (the pose jump would corrupt the localization).
+        """
         raise NotImplementedError
 
     def teleop(self, client_id, message):
@@ -351,37 +367,243 @@ class ApiError(Exception):
         self.headers = headers
 
 
-def _token_from_yaml(path):
-    """Return auth.token from a bridge YAML file, or None if absent or malformed."""
-    try:
-        with open(path, encoding='utf-8') as handle:
-            data = yaml.safe_load(handle)
-        token = data[NODE_SECTION]['ros__parameters']['auth']['token']
-    except (OSError, yaml.YAMLError, KeyError, TypeError):
-        return None
-    return token if isinstance(token, str) else None
-
-
-def resolve_token(param_dir, environ=None):
-    """
-    Pick the token: env MTRB_WEB_TOKEN, else web.local.yaml, else web.yaml.
-
-    Returns '' when nothing usable is found (the caller must refuse to start).
-    """
-    environ = os.environ if environ is None else environ
-    token = environ.get(TOKEN_ENV_VAR, '')
-    if token:
-        return token
-    for name in (LOCAL_PARAM_FILE, DEFAULT_PARAM_FILE):
-        token = _token_from_yaml(os.path.join(param_dir, name))
-        if token:
-            return token
-    return ''
+class TokenError(Exception):
+    """The token source is unusable (never carries the token or its file content)."""
 
 
 def is_placeholder_token(token):
     """Return True if the token is the public example value from the repository."""
     return token.strip().upper().startswith(PLACEHOLDER_TOKEN_PREFIX)
+
+
+def is_weak_token(token):
+    """
+    Return True if the token is a placeholder or has too little entropy.
+
+    Weak means: example marker, shorter than TOKEN_MIN_LENGTH, blank, or a single
+    repeated character.
+    """
+    stripped = token.strip()
+    return (is_placeholder_token(stripped) or len(stripped) < TOKEN_MIN_LENGTH
+            or len(set(stripped)) < 2)
+
+
+def read_token_file(path):
+    """
+    Read the token from a private file; return None if the file does not exist.
+
+    The file must be a REGULAR file (a symlink is refused: O_NOFOLLOW), owned by the user
+    running the node, with no group/other permission (mode & 0o077 == 0). It is opened once
+    and checked through the descriptor (no race between check and read). Raise TokenError
+    with a fixed message otherwise; the content is never put in a message.
+    """
+    expanded = os.path.expanduser(path) if isinstance(path, str) else ''
+    if not expanded or expanded.startswith('~') or not os.path.isabs(expanded):
+        raise TokenError('auth.token_file must be an absolute path (or start with ~/)')
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    try:
+        fd = os.open(expanded, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as err:  # includes ELOOP for a symlink
+        raise TokenError(
+            f'Cannot open the token file ({type(err).__name__}): it must be a regular file, '
+            'not a symlink') from err
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise TokenError('The token file must be a regular file')
+        if info.st_uid != os.geteuid():
+            raise TokenError('The token file must be owned by the user running the node')
+        if stat.S_IMODE(info.st_mode) & TOKEN_FILE_FORBIDDEN_MODE:
+            raise TokenError('The token file must not be accessible by group or others '
+                             '(chmod 600)')
+        raw = os.read(fd, TOKEN_FILE_MAX_BYTES + 1)
+    except OSError as err:
+        raise TokenError(f'Cannot read the token file ({type(err).__name__})') from err
+    finally:
+        os.close(fd)
+    if len(raw) > TOKEN_FILE_MAX_BYTES:
+        raise TokenError('The token file is too large')
+    try:
+        return raw.decode('utf-8').strip()
+    except UnicodeDecodeError:
+        raise TokenError('The token file is not valid UTF-8') from None
+
+
+def load_token(token_file, environ=None):
+    """
+    Return the token: env MTRB_WEB_TOKEN first, else the private file `token_file`.
+
+    Neither source is a ROS parameter (a parameter is readable by anyone in the ROS domain).
+    The value is stripped and never logged. Return '' if no source has a token; raise
+    TokenError if the file exists but is unsafe.
+    """
+    environ = os.environ if environ is None else environ
+    token = environ.get(TOKEN_ENV_VAR, '').strip()
+    if token:
+        return token
+    return read_token_file(token_file) or ''
+
+
+class EventSummary:
+    """
+    Turn a flood of identical events into at most one counted log line per period.
+
+    `note()` counts an event and returns the text to log when the period has elapsed (the
+    first event is returned at once); `poll()` returns the pending count when the period has
+    elapsed without new events. Thread-safe; the clock is injectable (monotonic seconds).
+    """
+
+    def __init__(self, label, period_s=EVENT_SUMMARY_PERIOD_S, clock=time.monotonic):
+        """Store the plural `label` used in the text and the minimum period in seconds."""
+        self._label = label
+        self._period_s = period_s
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._count = 0
+        self._last_emit_s = None
+
+    def _due_locked(self, now_s):
+        """Return True if a line may be emitted now (lock held)."""
+        return (self._last_emit_s is None or now_s < self._last_emit_s
+                or now_s - self._last_emit_s >= self._period_s)
+
+    def _render_locked(self, now_s):
+        """Reset the counter and return the text for it (lock held)."""
+        text = f'{self._count} {self._label} in the last window'
+        self._count = 0
+        self._last_emit_s = now_s
+        return text
+
+    def note(self):
+        """Count one event; return the summary text if one is due, else None."""
+        now_s = self._clock()
+        with self._lock:
+            self._count += 1
+            return self._render_locked(now_s) if self._due_locked(now_s) else None
+
+    def poll(self):
+        """Return the summary text of pending events once the period elapsed, else None."""
+        now_s = self._clock()
+        with self._lock:
+            if self._count and self._due_locked(now_s):
+                return self._render_locked(now_s)
+            return None
+
+
+class AuthFailureLimiter:
+    """
+    Per-client-IP limit of failed tokens (anti brute force), with a bounded table.
+
+    After `max_failures` failures inside `window_s` the IP is blocked for `block_s`. Only
+    failures feed it; a valid token never creates an entry. The table keeps at most
+    `max_ips` entries: expired ones are dropped first and then the oldest. The clock is
+    injectable (monotonic seconds). Thread-safe.
+    """
+
+    def __init__(self, clock=time.monotonic, max_failures=AUTH_MAX_FAILURES,
+                 window_s=AUTH_WINDOW_S, block_s=AUTH_BLOCK_S, max_ips=AUTH_MAX_TRACKED_IPS):
+        """Store the limits and an empty table."""
+        self._clock = clock
+        self._max_failures = max_failures
+        self._window_s = window_s
+        self._block_s = block_s
+        self._max_ips = max_ips
+        self._lock = threading.Lock()
+        self._table = collections.OrderedDict()  # ip -> [failures, window_start, blocked_until]
+
+    def __len__(self):
+        """Return the number of tracked IPs."""
+        with self._lock:
+            return len(self._table)
+
+    def blocked(self, ip):
+        """Return True while `ip` is blocked."""
+        now_s = self._clock()
+        with self._lock:
+            entry = self._table.get(ip)
+            if entry is None:
+                return False
+            if self._expired(entry, now_s):
+                del self._table[ip]
+                return False
+            return entry[2] is not None and now_s < entry[2]
+
+    def record_failure(self, ip):
+        """Count a failed token of `ip`; return True if it is (now) blocked."""
+        now_s = self._clock()
+        with self._lock:
+            entry = self._table.get(ip)
+            if entry is not None and self._expired(entry, now_s):
+                del self._table[ip]
+                entry = None
+            if entry is None:
+                self._make_room_locked(now_s)
+                entry = [0, now_s, None]
+                self._table[ip] = entry
+            if entry[2] is not None:
+                return True  # already blocked: the block is not extended
+            entry[0] += 1
+            if entry[0] >= self._max_failures:
+                entry[2] = now_s + self._block_s
+                return True
+            return False
+
+    def _expired(self, entry, now_s):
+        """Return True if the entry carries no information any more."""
+        if entry[2] is not None:
+            return now_s >= entry[2] or now_s < entry[2] - self._block_s  # clock went back
+        return now_s - entry[1] >= self._window_s or now_s < entry[1]
+
+    def _make_room_locked(self, now_s):
+        """Free one slot if the table is full: expired entries first, else the oldest."""
+        if len(self._table) < self._max_ips:
+            return
+        for key in [k for k, e in self._table.items() if self._expired(e, now_s)]:
+            del self._table[key]
+        while len(self._table) >= self._max_ips:
+            self._table.popitem(last=False)
+
+
+def _hostport(netloc, scheme):
+    """Return (host, port) of a netloc, filling in the default port of `scheme`, or None."""
+    try:
+        parts = urlsplit('//' + netloc)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not host or '@' in netloc:
+        return None
+    default = {'http': 80, 'ws': 80, 'https': 443, 'wss': 443}.get(scheme)
+    return host.lower(), port if port is not None else default
+
+
+def origin_matches_host(origin, host_header):
+    """
+    Return True if the Origin header names the same host:port as the Host header.
+
+    Used against cross-site WebSocket hijacking. `origin` None (no header: a non-browser
+    client) is accepted by the caller before calling this; here a missing or unparsable
+    Host, the literal Origin `null` or another scheme than http/https is a mismatch.
+    """
+    if not host_header:
+        return False
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        return False
+    origin_hp = _hostport(parsed.netloc, parsed.scheme)
+    host_hp = _hostport(host_header, parsed.scheme)
+    return origin_hp is not None and origin_hp == host_hp
+
+
+def client_key(client):
+    """Return the IP string of a Starlette `client` (host, port) tuple, or a fixed key."""
+    host = getattr(client, 'host', None)
+    return host if isinstance(host, str) and host else AUTH_UNKNOWN_CLIENT
 
 
 def _extract_bearer(request):
@@ -469,10 +691,10 @@ def _map_save_from_body(body):
                        'Body must be a JSON object with name and optional overwrite')
     try:
         name = valid_map_name(body['name'])
-    except ReservedMapNameError as err:
-        raise ApiError(400, 'reserved_name', 'That map name is not allowed') from err
+    except ReservedMapNameError:
+        raise ApiError(400, 'reserved_name', 'That map name is not allowed') from None
     except ValueError as err:
-        raise ApiError(400, 'invalid_name', str(err)) from err
+        raise ApiError(400, 'invalid_name', str(err)) from None
     overwrite = body.get('overwrite', False)
     if not isinstance(overwrite, bool):
         raise ApiError(400, 'invalid_body', 'Field overwrite must be a boolean')
@@ -750,8 +972,8 @@ async def _read_json(request):
         return None
     try:
         return json.loads(raw.decode('utf-8'), parse_constant=_reject_constant)
-    except (UnicodeDecodeError, ValueError, RecursionError) as err:
-        raise ApiError(400, 'invalid_json', 'Body is not valid JSON') from err
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise ApiError(400, 'invalid_json', 'Body is not valid JSON') from None
 
 
 def _reject_constant(name):
@@ -762,9 +984,15 @@ def _reject_constant(name):
 def create_app(store, token, static_dir=None, hub=None, max_ws_bytes=DEFAULT_MAX_WS_BYTES,
                nav_port=None, dock=None, map_port=None, map_dir=None, on_event=None,
                map_min_free_mb=MAP_MIN_FREE_MB_DEFAULT,
-               map_min_interval_s=MAP_MIN_INTERVAL_S_DEFAULT):
+               map_min_interval_s=MAP_MIN_INTERVAL_S_DEFAULT, auth_limiter=None):
     """
     Build the FastAPI app. An empty token is rejected (fail closed).
+
+    `auth_limiter` (AuthFailureLimiter) limits the failed tokens per client IP: an IP that
+    is blocked gets 429 `too_many_attempts` (REST) or a rejected handshake (WebSocket), even
+    with a valid token, EXCEPT on POST /api/stop, which a valid token always reaches. The
+    client IP is the socket peer (X-Forwarded-For is never trusted). A WebSocket whose Origin
+    header does not match its Host header is rejected before accept (anti CSWSH).
 
     `nav_port` (a NavPort) executes the navigation commands; without it they answer 503.
     `map_port` (a MapPort) and `map_dir` (absolute directory) enable /api/map/save and
@@ -794,20 +1022,72 @@ def create_app(store, token, static_dir=None, hub=None, max_ws_bytes=DEFAULT_MAX
         return JSONResponse(status_code=err.status_code, headers=err.headers,
                             content={'error': err.code, 'detail': err.detail})
 
-    def require_token(request: Request):
-        given = _extract_bearer(request).encode('utf-8')
-        if not hmac.compare_digest(given, expected):
+    limiter = AuthFailureLimiter() if auth_limiter is None else auth_limiter
+    fail_log = EventSummary('failed authentication attempt(s)', AUTH_LOG_PERIOD_S)
+    lock_log = EventSummary('request(s) refused for too many failed tokens',
+                            AUTH_LOG_PERIOD_S)
+    origin_log = EventSummary('WebSocket(s) refused for a foreign Origin', AUTH_LOG_PERIOD_S)
+
+    def report(summary):
+        """Count an event and log the summary line if one is due (never any credential)."""
+        text = summary.note()
+        if text is not None and on_event is not None:
+            on_event('warning', text)
+
+    def token_decision(given, client, stop_exempt=False):
+        """
+        Return None (allowed), 'invalid' (401) or 'locked' (429) for a presented token.
+
+        The limiter is only fed by failures. A blocked IP is refused even with a valid
+        token (else the block would not stop guessing) unless `stop_exempt`: the stop
+        endpoint is never blocked for a valid token. An invalid token from a blocked IP is
+        'locked' and is not counted again.
+        """
+        ip = client_key(client)
+        if hmac.compare_digest(given, expected):
+            if stop_exempt or not limiter.blocked(ip):
+                return None
+            report(lock_log)
+            return 'locked'
+        if limiter.blocked(ip):
+            report(lock_log)
+            return 'locked'
+        report(fail_log)
+        limiter.record_failure(ip)
+        return 'invalid'
+
+    def check_request_token(request, stop_exempt=False):
+        decision = token_decision(_extract_bearer(request).encode('utf-8'), request.client,
+                                  stop_exempt)
+        if decision == 'locked':
+            raise ApiError(429, 'too_many_attempts',
+                           'Too many failed attempts: wait a minute',
+                           {'Retry-After': str(int(AUTH_BLOCK_S))})
+        if decision == 'invalid':
             raise ApiError(401, 'unauthorized', 'Missing or invalid token',
                            {'WWW-Authenticate': 'Bearer'})
+
+    async def require_token(request: Request):
+        # `async def`: pure CPU, runs on the event loop (never waits for the thread pool).
+        check_request_token(request)
+
+    async def require_token_stop(request: Request):
+        check_request_token(request, stop_exempt=True)
 
     hub = BroadcastHub() if hub is None else hub
     client_ids = itertools.count(1)  # one unique id per WebSocket connection
 
     @app.websocket(WS_PATH)
     async def ws_endpoint(websocket: WebSocket):
-        # Authenticate before accepting: a bad token never takes a client slot.
+        # Everything is decided BEFORE accepting: a refused client never takes a slot and a
+        # browser sees a failed handshake (1006), never an accepted socket closed with 1008.
+        origin = websocket.headers.get('origin')
+        if origin is not None and not origin_matches_host(origin, websocket.headers.get('host')):
+            report(origin_log)
+            await websocket.close(code=WS_CLOSE_UNAUTHORIZED)
+            return
         given = websocket.query_params.get('token', '').encode('utf-8')
-        if not hmac.compare_digest(given, expected):
+        if token_decision(given, websocket.client) is not None:
             await websocket.close(code=WS_CLOSE_UNAUTHORIZED)
             return
         await websocket.accept()
@@ -874,7 +1154,7 @@ def create_app(store, token, static_dir=None, hub=None, max_ws_bytes=DEFAULT_MAX
         try:
             x, y, yaw = validate_goal(*pose, grid)
         except ValueError as err:
-            raise ApiError(400, 'invalid_goal', str(err)) from err
+            raise ApiError(400, 'invalid_goal', str(err)) from None
         return {'ok': True, 'goal_id': run_nav(port.send_goal, x, y, yaw)}
 
     @app.post('/api/goal', dependencies=[Depends(require_token)])
@@ -899,12 +1179,12 @@ def create_app(store, token, static_dir=None, hub=None, max_ws_bytes=DEFAULT_MAX
         run_nav(require_nav().cancel)
         return {'ok': True}
 
-    @app.post('/api/stop', dependencies=[Depends(require_token)])
+    @app.post('/api/stop', dependencies=[Depends(require_token_stop)])
     async def post_stop():
         # Zero Twist first, then cancel; independent of Nav2, map and mode. No body.
-        # `async def` on purpose: the handler body runs on the event loop. The sync
-        # `require_token` dependency still runs in the thread pool (pure CPU, no I/O), so a
-        # saturated pool could delay the request; NavPort.stop() itself must never block.
+        # `async def` on purpose: handler and token check both run on the event loop (no
+        # thread pool); NavPort.stop() itself must never block. A valid token is never
+        # refused here, not even for an IP blocked for failed tokens.
         require_nav().stop()
         return {'ok': True}
 
@@ -915,7 +1195,17 @@ def create_app(store, token, static_dir=None, hub=None, max_ws_bytes=DEFAULT_MAX
         if mode != MAP_MODE:
             raise ApiError(409, 'wrong_mode',
                            f'Initial pose is only accepted in mode map (mode: {mode})')
-        run_nav(require_nav().publish_initial_pose, *pose)
+        port = require_nav()
+        grid = store.grid()
+        if grid is None:  # fail safe: a pose that cannot be checked is not published
+            raise ApiError(503, 'no_map', 'No map available yet')
+        try:  # inside the map is enough: the cell may be free, unknown or occupied
+            validate_goal(*pose, {key: value for key, value in grid.items() if key != 'data'})
+        except ValueError as err:
+            raise ApiError(400, 'invalid_pose', str(err).replace('Goal', 'Pose')) from None
+        # The port answers NavBusyError (409 goal_active) while Nav2 may be driving (goal,
+        # orphan goal, pending cancel-all) or a teleop controller is active.
+        run_nav(port.publish_initial_pose, *pose)
         return {'ok': True}
 
     map_saver = None

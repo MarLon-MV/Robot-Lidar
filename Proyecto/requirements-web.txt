@@ -1,5 +1,6 @@
 # Python dependencies of mtrb_web_bridge (install in the Pi venv, see README).
-fastapi>=0.110,<1.0
+fastapi>=0.120,<1.0
+starlette>=0.49.1  # CVE-2025-62727 (FileResponse/Range)
 uvicorn[standard]>=0.29,<1.0
 
 # Test only (required by fastapi.testclient); not needed on the robot at runtime.

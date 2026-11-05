@@ -1,5 +1,6 @@
 """Pure helpers for the web bridge (no ROS imports, easy to test)."""
 
+import array
 import collections
 import math
 import os
@@ -79,6 +80,11 @@ def occupancy_to_bytes(data, width, height):
     if cell_count != width * height:
         raise ValueError(f'Map data has {len(data)} cells, expected {width * height}')
     raw = _int8_buffer_to_bytes(data)
+    if raw is None and isinstance(data, (list, tuple)):
+        try:  # C-speed conversion of a plain sequence; values outside int8 use the slow path
+            raw = array.array('b', data).tobytes()
+        except (TypeError, ValueError, OverflowError):
+            raw = None
     if raw is None:
         try:
             raw = bytes(int(v) & 0xFF for v in data)  # int8 two's complement: -1 -> 0xFF

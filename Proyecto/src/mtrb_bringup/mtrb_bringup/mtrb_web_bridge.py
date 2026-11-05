@@ -1,5 +1,6 @@
 """ROS 2 node that hosts the web server (FastAPI + uvicorn) next to rclpy."""
 
+import array
 import functools
 import hashlib
 import math
@@ -17,9 +18,10 @@ from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from lifecycle_msgs.srv import GetState
 from mtrb_bringup.utils import MODES, validate_web_port
 from mtrb_bringup.web_server import (
-    BroadcastHub, create_app, is_placeholder_token, json_message, MapPort, NavBusyError,
-    NavPort, NavUnavailableError, resolve_token, SlamTimeoutError, SlamUnavailableError,
-    StateStore, TOKEN_ENV_VAR)
+    BroadcastHub, create_app, DEFAULT_TOKEN_FILE, EventSummary,
+    is_weak_token, json_message, load_token, MapPort, NavBusyError, NavPort,
+    NavUnavailableError, SlamTimeoutError, SlamUnavailableError, StateStore, TOKEN_MIN_LENGTH,
+    TokenError)
 from mtrb_bringup.web_utils import (
     downsample_scan, occupancy_to_bytes, pack_map_binary, quaternion_from_yaw,
     scan_to_map_points, simplify_path, TELEOP_PUBLISH, TELEOP_ZERO, TELEOP_ZERO_BURST,
@@ -133,7 +135,8 @@ PARAMETERS = (
     ('plan.max_points', 200),
     ('limits.max_clients', 5),
     ('limits.max_ws_bytes', 4096),
-    ('auth.token', ''),
+    ('limits.max_connections', 64),   # uvicorn limit_concurrency (HTTP + WebSocket)
+    ('auth.token_file', DEFAULT_TOKEN_FILE),  # path of the private token file (not the token)
     ('dock.x', 0.0),                  # m
     ('dock.y', 0.0),                  # m
     ('dock.yaw', 0.0),                # rad
@@ -149,16 +152,20 @@ PARAMETERS = (
 
 # Parameters that accept both int and float from YAML (e.g. `teleop.max_vx: 1`): declared
 # with dynamic typing so rclpy does not raise at declaration; _number() validates the type.
-# `auth.token` is dynamic too (YAML may deliver a numeric token) and `status.nodes` so that an
-# empty list is not rejected by the static typing. Every other parameter keeps static typing:
+# `status.nodes` is dynamic too so that an empty list is not rejected by the static typing.
+# There is NO token parameter: a ROS parameter is readable by the whole ROS domain.
+# Every other parameter keeps static typing:
 # a wrong type is reported as ConfigError by _declare_parameters.
 DYNAMIC_PARAMETERS = frozenset((
-    'auth.token', 'rates.pose', 'rates.scan', 'rates.status', 'rates.lifecycle',
+    'rates.pose', 'rates.scan', 'rates.status', 'rates.lifecycle',
     'teleop.max_vx', 'teleop.max_wz', 'scan.min_range', 'scan.max_range',
     'dock.x', 'dock.y', 'dock.yaw', 'maps.min_free_mb', 'maps.min_interval_s',
     'status.nodes'))
 
-TOKEN_MIN_LENGTH = 16                       # characters
+UVICORN_KEEP_ALIVE_S = 5             # idle keep-alive connections are closed after this
+UVICORN_MAX_HEADER_BYTES = 16384     # h11_max_incomplete_event_size (HTTP request head)
+MAX_CONNECTIONS_LIMIT = 1024         # ceiling of limits.max_connections
+LOG_SUMMARY_PERIOD_S = 1.0           # stop/cancel floods are logged at most once per period
 # uvicorn is bound through an AF_INET socket (start_server), so in practice only IPv4 hosts
 # can be listened on; '::1' is accepted here but cannot be bound (the bind fails: ConfigError).
 LOOPBACK_HOSTS = ('127.0.0.1', '::1', 'localhost')
@@ -188,10 +195,7 @@ class MtrbWebBridge(Node, NavPort, MapPort):
             raise ConfigError('Invalid host: empty')
 
         share = get_package_share_directory(PACKAGE_NAME)
-        token = self._select_token(share + '/param')
-        if not token:
-            raise ConfigError(
-                'No auth token: set MTRB_WEB_TOKEN or auth.token in param/web.local.yaml')
+        token = self._load_token()
         self._check_token_strength(token)
 
         self._read_settings()
@@ -228,11 +232,32 @@ class MtrbWebBridge(Node, NavPort, MapPort):
                     TypeError, ValueError) as err:
                 raise ConfigError(
                     f'Invalid parameter {name}: wrong type or value ({type(err).__name__})'
-                ) from err
+                ) from None  # the rclpy cause message includes the value
+
+    def _load_token(self):
+        """
+        Read the token from MTRB_WEB_TOKEN or the private file auth.token_file; ConfigError.
+
+        The token is never a ROS parameter. Neither the token nor the file content is ever
+        printed or logged.
+        """
+        token_file = self.get_parameter('auth.token_file').value
+        if not isinstance(token_file, str):
+            raise ConfigError('Invalid parameter auth.token_file: string expected')
+        try:
+            token = load_token(token_file)
+        except TokenError as err:
+            raise ConfigError(f'Unusable auth token file: {err}') from err
+        if not token:
+            raise ConfigError(
+                'No auth token: set the environment variable MTRB_WEB_TOKEN or create the '
+                f'file {token_file} (mode 0600, owned by this user, regular file) with a '
+                f'random token of at least {TOKEN_MIN_LENGTH} characters')
+        return token
 
     def _check_token_strength(self, token):
         """
-        Refuse the example token and tokens shorter than TOKEN_MIN_LENGTH; raise ConfigError.
+        Refuse the example token and weak tokens (see is_weak_token); raise ConfigError.
 
         The only exception is auth.allow_example_token=true (a strict bool read from the node
         parameters, never from a client) together with a loopback host: a warning is logged.
@@ -242,14 +267,16 @@ class MtrbWebBridge(Node, NavPort, MapPort):
         if not isinstance(allow, bool):  # validated always, whatever the token strength
             raise ConfigError(
                 f'Invalid parameter auth.allow_example_token: {allow!r} (bool)')
-        weak = is_placeholder_token(token) or len(token) < TOKEN_MIN_LENGTH
-        if not weak:
+        if not token.strip():
+            raise ConfigError('The auth token is blank')
+        if not is_weak_token(token):
             return
         if not (allow and str(self.host).strip().lower() in LOOPBACK_HOSTS):
             raise ConfigError(
-                f'The auth token is the example one or shorter than {TOKEN_MIN_LENGTH} '
-                'characters: set a real token in param/web.local.yaml or MTRB_WEB_TOKEN '
-                '(auth.allow_example_token is only honoured for a loopback host)')
+                f'The auth token is the example one, blank, a single repeated character or '
+                f'shorter than {TOKEN_MIN_LENGTH} characters: use a random one in '
+                'MTRB_WEB_TOKEN or the token file (auth.allow_example_token is only honoured '
+                'for a loopback host)')
         self.get_logger().warning(
             'DEVELOPMENT ONLY: weak or example auth token accepted because '
             'auth.allow_example_token is true and the host is loopback')
@@ -276,6 +303,10 @@ class MtrbWebBridge(Node, NavPort, MapPort):
         self._plan_max_points = self._number('plan.max_points', 2, integer=True)
         self._max_clients = self._number('limits.max_clients', 1, integer=True)
         self._max_ws_bytes = self._number('limits.max_ws_bytes', 1, integer=True)
+        self._max_connections = self._number('limits.max_connections', 1, integer=True)
+        if self._max_connections > MAX_CONNECTIONS_LIMIT:
+            raise ConfigError(f'Invalid parameter limits.max_connections: '
+                              f'{self._max_connections!r} (at most {MAX_CONNECTIONS_LIMIT})')
         self._dock = tuple(float(self._number(f'dock.{axis}', -DOCK_LIMIT))
                            for axis in ('x', 'y', 'yaw'))
         if any(abs(v) > DOCK_LIMIT for v in self._dock):
@@ -390,6 +421,14 @@ class MtrbWebBridge(Node, NavPort, MapPort):
         # 'stamp_ns' is the ROS time of the DECISION (see _request_cancel_all); retries reuse it.
         self._cancel_all = None
         self._cancel_all_warn_s = float('-inf')  # last 'service not ready' warning
+        # Floods (a client can send stops at the WebSocket rate) become one counted line per
+        # LOG_SUMMARY_PERIOD_S; the first event is logged at once. Behavior is unchanged.
+        self._log_summaries = {
+            'stop': (EventSummary('stop(s)', LOG_SUMMARY_PERIOD_S), 'warning'),
+            'cancel': (EventSummary('navigation cancel request(s)', LOG_SUMMARY_PERIOD_S),
+                       'info'),
+            'zero': (EventSummary('teleop zero burst(s) published', LOG_SUMMARY_PERIOD_S),
+                     'info')}
         self._stop_context = threading.local()  # per-thread: True while stop() runs
         self._last_cancel_all_armed_s = None  # monotonic time of the last armed cancel-all
         self._cancel_all_client = None  # public CancelGoal service client (see _init_ros_io)
@@ -770,9 +809,7 @@ class MtrbWebBridge(Node, NavPort, MapPort):
         if send_all and self._request_cancel_all(stamp_ns):
             self._count_cancel_all_sent(now)
         if token is not None or targets or send_all:
-            self.get_logger().info(
-                f'Navigation cancel requested ({len(targets)} handle(s), '
-                f'cancel-all {"yes" if send_all else "no"})')
+            self._log_summarized('cancel')
 
     def _cancel_all_coalesced(self):
         """Return True if a stop-armed cancel-all is skipped as too close to the last one."""
@@ -908,7 +945,17 @@ class MtrbWebBridge(Node, NavPort, MapPort):
         self.get_logger().warning(f'Cancel of goal {token} rejected (code {code}); will retry')
 
     def publish_initial_pose(self, x_m, y_m, yaw_rad):
-        """Publish the pose estimate on `initialpose` (the only pose publisher here)."""
+        """
+        Publish the pose estimate on `initialpose` (the only pose publisher here).
+
+        Refused with NavBusyError (409 goal_active) while Nav2 may be driving (`_nav_busy`)
+        or a teleop controller holds a fresh lease.
+        """
+        gate = self._teleop_gate
+        with self._teleop_lock:  # lock order: _teleop_lock -> _nav_lock
+            busy = self._nav_busy() or (gate is not None and gate.active)
+        if busy:
+            raise NavBusyError('Robot is moving or navigating: stop it before setting the pose')
         msg = PoseWithCovarianceStamped()
         msg.header.frame_id = MAP_FRAME
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -951,12 +998,26 @@ class MtrbWebBridge(Node, NavPort, MapPort):
         except Exception as err:  # noqa: B902 - keep trying the remaining zeros
             self.get_logger().error(f'Could not publish on cmd_vel_nav: {err}')
 
+    def _log_summarized(self, key):
+        """Count an event of a flood-prone kind and log the summary line if one is due."""
+        summary, level = self._log_summaries[key]
+        text = summary.note()
+        if text is not None:
+            getattr(self.get_logger(), level)(text)
+
+    def _flush_log_summaries(self):
+        """Log the counts that are still pending once their period elapsed (watchdog tick)."""
+        for summary, level in self._log_summaries.values():
+            text = summary.poll()
+            if text is not None:
+                getattr(self.get_logger(), level)(text)
+
     def _teleop_execute(self, action):
         """Execute a TeleopAction; `_teleop_lock` must be held. Zeros go first."""
         for _ in range(action.zeros):
             self._publish_cmd_vel_nav(0.0, 0.0)
         if action.zeros:
-            self.get_logger().info(f'Teleop ended: {action.zeros} zero Twist(s) published')
+            self._log_summarized('zero')
         if action.kind == TELEOP_PUBLISH and action.twist is not None:
             self._publish_cmd_vel_nav(*action.twist)
 
@@ -1021,7 +1082,7 @@ class MtrbWebBridge(Node, NavPort, MapPort):
         The zero Twist is always issued before (and independently of) the cancel, which
         never raises by design; a failure there is only logged.
         """
-        self.get_logger().warning('Stop requested from the web')
+        self._log_summarized('stop')
         self._stop_teleop_only()
         self._stop_context.active = True
         try:
@@ -1033,6 +1094,7 @@ class MtrbWebBridge(Node, NavPort, MapPort):
 
     def _teleop_watchdog(self):
         """Periodic: zero Twist burst (once) when the controlling client went silent."""
+        self._flush_log_summaries()
         gate = self._teleop_gate
         if gate is None:
             return
@@ -1290,12 +1352,19 @@ class MtrbWebBridge(Node, NavPort, MapPort):
             return
         meta = {'width': info.width, 'height': info.height, 'resolution': info.resolution,
                 'origin_x': info.origin.position.x, 'origin_y': info.origin.position.y}
-        digest = hashlib.blake2b(bytes(memoryview(msg.data).cast('B')), digest_size=16)
+        data = msg.data
+        if not isinstance(data, (array.array, memoryview, bytes, bytearray)):
+            try:  # defensive: rclpy delivers array('b'); a list is converted once, in C
+                data = array.array('b', data)
+            except (TypeError, OverflowError, ValueError):
+                self._warn_throttled('map-invalid', 'Invalid map ignored (cell values)')
+                return
+        digest = hashlib.blake2b(bytes(memoryview(data).cast('B')), digest_size=16)
         signature = (tuple(meta.values()), digest.digest())
         if signature == self._map_signature:
             return
         try:
-            compressed = occupancy_to_bytes(msg.data, info.width, info.height)
+            compressed = occupancy_to_bytes(data, info.width, info.height)
             version = (self._map_version + 1) % (2 ** 32)
             meta_json = json_message('map_meta', version=version, **meta)
             binary = pack_map_binary(version, compressed)
@@ -1306,22 +1375,6 @@ class MtrbWebBridge(Node, NavPort, MapPort):
         self._map_version = version
         self.hub.publish('map', (meta_json, binary))
         self.store.update(map={'version': version, **meta})
-
-    def _select_token(self, param_dir):
-        """
-        Token priority: env MTRB_WEB_TOKEN > parameter auth.token > share files.
-
-        Never logged. Returns '' if nothing usable is found.
-        """
-        env_token = os.environ.get(TOKEN_ENV_VAR, '')
-        if env_token:
-            return env_token
-        value = self.get_parameter('auth.token').value
-        if value is not None and not isinstance(value, bool):
-            param_token = str(value).strip()
-            if param_token:
-                return param_token
-        return resolve_token(param_dir)
 
     def start_server(self):
         """Bind the port (fail if busy) and run uvicorn in a daemon thread."""
@@ -1336,8 +1389,15 @@ class MtrbWebBridge(Node, NavPort, MapPort):
         # Access log off: later WebSocket URLs carry the token in the query string.
         # access_log=False relies on log_level='warning' too: at 'info' uvicorn would log
         # the WebSocket route including the ?token= query string.
+        # Slow-client limits (real uvicorn.Config options): limit_concurrency answers 503 to
+        # new connections beyond the bound, timeout_keep_alive closes idle keep-alive
+        # connections, h11_max_incomplete_event_size bounds the request head (h11 only).
+        # uvicorn has NO timeout for a request head sent slowly (slowloris): residual risk.
         config = uvicorn.Config(self.app, log_level='warning', access_log=False,
-                                ws_max_size=self._max_ws_bytes)
+                                ws_max_size=self._max_ws_bytes,
+                                limit_concurrency=self._max_connections,
+                                timeout_keep_alive=UVICORN_KEEP_ALIVE_S,
+                                h11_max_incomplete_event_size=UVICORN_MAX_HEADER_BYTES)
         self.server = uvicorn.Server(config)
         self.thread = threading.Thread(
             target=self.server.run, kwargs={'sockets': [sock]}, name='uvicorn', daemon=True)

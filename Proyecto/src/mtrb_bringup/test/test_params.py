@@ -52,8 +52,52 @@ def _flatten(d, prefix=''):
     return keys
 
 
-def test_web_token_is_the_placeholder():
-    assert _web_params('web.yaml')['auth']['token'] == 'CHANGE-ME-example-token'
+SECRET_KEY_WORDS = ('token', 'secret', 'password', 'passwd', 'credential', 'apikey', 'api_key')
+
+
+def _key_paths(d, prefix=''):
+    """Every key path of a nested dict, lowercase (including the intermediate ones)."""
+    paths = []
+    for k, v in d.items():
+        path = f'{prefix}{k}'.lower()
+        paths.append(path)
+        if isinstance(v, dict):
+            paths += _key_paths(v, path + '.')
+    return paths
+
+
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_web_yaml_holds_no_token_nor_any_secret_key(file_name):
+    # The token is NOT a ROS parameter: only env MTRB_WEB_TOKEN or the file auth.token_file.
+    auth = _web_params(file_name)['auth']
+    assert 'token' not in auth
+    assert set(auth) == {'token_file', 'allow_example_token'}
+    allowed = {'auth.token_file', 'auth.allow_example_token'}
+    offenders = [path for path in _key_paths(_web_params(file_name))
+                 if path not in allowed
+                 and any(w in path.split('.')[-1] for w in SECRET_KEY_WORDS)]
+    assert offenders == []
+
+
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_web_yaml_values_do_not_look_like_a_literal_token(file_name):
+    values = [v for v in _flatten_values(_web_params(file_name)) if isinstance(v, str)]
+    assert not [v for v in values if v.upper().startswith('CHANGE-ME')]
+
+
+def _flatten_values(d):
+    for v in d.values():
+        if isinstance(v, dict):
+            yield from _flatten_values(v)
+        else:
+            yield v
+
+
+@pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
+def test_web_token_file_is_an_absolute_or_home_relative_path_not_a_token(file_name):
+    token_file = _web_params(file_name)['auth']['token_file']
+    assert token_file == '~/.config/mtrb/web_token'
+    assert os.path.isabs(os.path.expanduser(token_file))
 
 
 def test_web_and_example_have_same_keys():
@@ -82,6 +126,19 @@ def test_launch_web_params_file_argument_has_description():
     assert match is not None, 'web_params_file argument not declared'
     assert re.search(r"description\s*=\s*'[^']+'", match.group(1)), \
         'web_params_file has no description'
+
+
+def test_requirements_web_has_the_audited_minimum_versions():
+    import re as regex
+    path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'requirements-web.txt')
+    with open(path, encoding='utf-8') as handle:
+        lines = [line.split('#')[0].strip().lower() for line in handle
+                 if line.strip() and not line.startswith('#')]
+    by_name = {regex.split(r'[<>=!\[ ]', line, maxsplit=1)[0]: line for line in lines}
+    assert '>=0.120' in by_name['fastapi'].replace(' ', '')
+    assert '>=0.49.1' in by_name['starlette'].replace(' ', '')
+    assert any(line.startswith('uvicorn[standard]') for line in lines), lines
+    assert 'httpx' in by_name
 
 
 def test_requirements_web_includes_httpx():
@@ -190,7 +247,10 @@ def test_web_files_have_the_same_security_values():
     web, example = _web_params('web.yaml'), _web_params('web.example.yaml')
     assert web['auth']['allow_example_token'] is example['auth']['allow_example_token'] is False
     assert web['maps'] == example['maps']
-    assert web['auth']['token'] == example['auth']['token']
+    assert web['auth']['token_file'] == example['auth']['token_file']
+    assert web['limits']['max_connections'] == example['limits']['max_connections'] == 64
+    assert web['limits'] == example['limits']
+    assert 'token' not in web['auth'] and 'token' not in example['auth']
     assert web['host'] == example['host']
 
 

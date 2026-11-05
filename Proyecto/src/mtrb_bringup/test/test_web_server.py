@@ -1,7 +1,12 @@
 """Unit tests for mtrb_bringup.web_server (no ROS needed; needs fastapi and httpx)."""
 
+import asyncio
+import inspect
 import json
+import os
 import threading
+import traceback
+import types
 
 import pytest
 
@@ -10,15 +15,14 @@ pytest.importorskip('httpx')
 
 from fastapi.testclient import TestClient  # noqa: E402, I100
 from mtrb_bringup.web_server import (  # noqa: E402, I100
-    create_app, is_placeholder_token, resolve_token, StateStore)
+    AUTH_BLOCK_S, AUTH_MAX_FAILURES, AUTH_MAX_TRACKED_IPS, AUTH_WINDOW_S,
+    AuthFailureLimiter, create_app, DEFAULT_TOKEN_FILE, is_placeholder_token, is_weak_token,
+    load_token, read_token_file, StateStore, TOKEN_ENV_VAR, TOKEN_FILE_MAX_BYTES,
+    TOKEN_MIN_LENGTH, TokenError)
 
 TOKEN = 'secret-token-123'
 KEYS = {'mode', 'pose', 'scan_age', 'map', 'plan_len', 'nav', 'battery_pct', 'stamp',
         'dock'}
-
-
-def _yaml(token_line):
-    return f"mtrb_web_bridge:\n  ros__parameters:\n    auth:\n      token: {token_line}\n"
 
 
 @pytest.fixture
@@ -107,52 +111,7 @@ def test_docs_endpoints_are_disabled(client):
     assert client.get('/openapi.json').status_code == 404
 
 
-# --- resolve_token ------------------------------------------------------------------
-
-def test_resolve_token_env_has_priority(tmp_path):
-    (tmp_path / 'web.local.yaml').write_text(_yaml('local'))
-    (tmp_path / 'web.yaml').write_text(_yaml('default'))
-    assert resolve_token(str(tmp_path), {'MTRB_WEB_TOKEN': 'fromenv'}) == 'fromenv'
-
-
-def test_resolve_token_local_over_default(tmp_path):
-    (tmp_path / 'web.local.yaml').write_text(_yaml('local'))
-    (tmp_path / 'web.yaml').write_text(_yaml('default'))
-    assert resolve_token(str(tmp_path), {}) == 'local'
-
-
-def test_resolve_token_falls_back_to_default(tmp_path):
-    (tmp_path / 'web.yaml').write_text(_yaml('default'))
-    assert resolve_token(str(tmp_path), {}) == 'default'
-
-
-def test_resolve_token_empty_env_is_ignored(tmp_path):
-    (tmp_path / 'web.yaml').write_text(_yaml('default'))
-    assert resolve_token(str(tmp_path), {'MTRB_WEB_TOKEN': ''}) == 'default'
-
-
-def test_resolve_token_broken_local_falls_back_to_default(tmp_path):
-    (tmp_path / 'web.local.yaml').write_text('a: [unclosed\n  : :')
-    (tmp_path / 'web.yaml').write_text(_yaml('default'))
-    assert resolve_token(str(tmp_path), {}) == 'default'
-
-
-@pytest.mark.parametrize('content', [
-    'other: 1\n', '', 'just a string', 'mtrb_web_bridge:\n  ros__parameters: {}\n'])
-def test_resolve_token_yaml_without_key_returns_empty(tmp_path, content):
-    (tmp_path / 'web.yaml').write_text(content)
-    assert resolve_token(str(tmp_path), {}) == ''
-
-
-@pytest.mark.parametrize('value', ['12345', '[a, b]', 'null', 'true'])
-def test_resolve_token_non_string_token_is_ignored(tmp_path, value):
-    (tmp_path / 'web.yaml').write_text(_yaml(value))
-    assert resolve_token(str(tmp_path), {}) == ''
-
-
-def test_resolve_token_no_files_returns_empty(tmp_path):
-    assert resolve_token(str(tmp_path), {}) == ''
-
+# --- token sources: see the "token loading" section further down -----------------------
 
 def test_is_placeholder_token():
     assert is_placeholder_token('CHANGE-ME-please')
@@ -768,23 +727,74 @@ def test_dock_when_nav2_unavailable_returns_503():
 
 def test_initialpose_in_map_mode_publishes_validated_floats_and_never_sends_a_goal():
     client, nav, _ = _nav_client(mode='map')
-    response = _post(client, '/api/initialpose', {'x': 1, 'y': -2, 'yaw': 3})
+    response = _post(client, '/api/initialpose', {'x': 1, 'y': 2, 'yaw': 3})
     assert response.status_code == 200
     assert response.json() == {'ok': True}
-    assert nav.poses == [(1.0, -2.0, 3.0)]
+    assert nav.poses == [(1.0, 2.0, 3.0)]
     assert all(type(v) is float for v in nav.poses[0])
     assert nav.goals == []
 
 
-def test_initialpose_does_not_need_a_map():
+def test_initialpose_without_a_map_returns_503_no_map_and_publishes_nothing():
     client, nav, _ = _nav_client(grid=None, mode='map')
-    assert _post(client, '/api/initialpose', GOOD).status_code == 200
-    assert nav.poses == [(3.5, 2.5, 1.0)]
+    response = _post(client, '/api/initialpose', GOOD)
+    assert response.status_code == 503
+    assert response.json()['error'] == 'no_map'
+    assert nav.poses == []
 
 
-def test_initialpose_may_lie_outside_the_map():
+@pytest.mark.parametrize('pose', [{'x': 500, 'y': 500, 'yaw': 0}, {'x': -0.5, 'y': 1, 'yaw': 0},
+                                  {'x': 10.0, 'y': 1, 'yaw': 0}, {'x': 1, 'y': 10.5, 'yaw': 0},
+                                  {'x': 1, 'y': -1, 'yaw': 0}])
+def test_initialpose_outside_the_map_returns_400_invalid_pose(pose):
     client, nav, _ = _nav_client(mode='map')
-    assert _post(client, '/api/initialpose', {'x': 500, 'y': 500, 'yaw': 0}).status_code == 200
+    response = _post(client, '/api/initialpose', pose)
+    assert response.status_code == 400
+    assert response.json()['error'] == 'invalid_pose'
+    assert 'Goal' not in response.json()['detail']
+    assert nav.poses == []
+
+
+@pytest.mark.parametrize('pose', [
+    {'x': 1.5, 'y': 0.5, 'yaw': 0},     # cell (1, 0): unknown
+    {'x': 2.5, 'y': 0.5, 'yaw': 0},     # cell (2, 0): occupied
+    {'x': 9.5, 'y': 4.5, 'yaw': 0}])    # cell (9, 4): occupied (50)
+def test_initialpose_on_an_occupied_or_unknown_cell_inside_the_map_is_allowed(pose):
+    client, nav, _ = _nav_client(mode='map')
+    assert _post(client, '/api/initialpose', pose).status_code == 200
+    assert nav.poses == [(pose['x'], pose['y'], 0.0)]
+
+
+def test_initialpose_check_order_body_then_mode_then_map_then_pose_then_busy():
+    # 1) body first: invalid body wins over a wrong mode
+    client, nav, _ = _nav_client(mode='mapping', grid=None)
+    assert _post(client, '/api/initialpose', {'x': 1}).status_code == 400
+    # 2) mode before map: wrong mode and no map -> 409
+    assert _post(client, '/api/initialpose', GOOD).status_code == 409
+    # 3) map before pose: right mode, no map, pose outside the map -> 503
+    client, nav, _ = _nav_client(mode='map', grid=None)
+    assert _post(client, '/api/initialpose', {'x': 500, 'y': 500, 'yaw': 0}).status_code == 503
+    # 4) pose before busy: the port is never reached for an outside pose
+    busy = FakeNav(pose_error=NavBusyError('busy'))
+    client, nav, _ = _nav_client(nav=busy, mode='map')
+    assert _post(client, '/api/initialpose', {'x': 500, 'y': 500, 'yaw': 0}).status_code == 400
+    # 5) busy last
+    response = _post(client, '/api/initialpose', GOOD)
+    assert response.status_code == 409
+    assert response.json()['error'] == 'goal_active'
+
+
+def test_initialpose_while_nav_is_busy_returns_409_goal_active_and_publishes_nothing():
+    client, nav, _ = _nav_client(nav=FakeNav(pose_error=NavBusyError('busy')), mode='map')
+    response = _post(client, '/api/initialpose', GOOD)
+    assert response.status_code == 409
+    assert response.json()['error'] == 'goal_active'
+    assert nav.poses == []
+
+
+def test_initialpose_when_nav_is_unavailable_returns_503():
+    client, _, _ = _nav_client(nav=FakeNav(pose_error=NavUnavailableError('x')), mode='map')
+    assert _post(client, '/api/initialpose', GOOD).status_code == 503
 
 
 def test_initialpose_in_mapping_mode_returns_409_wrong_mode():
@@ -1630,3 +1640,994 @@ def test_placeholder_tokens_are_detected_whatever_the_case_and_the_outer_spaces(
                                    'CHANGE ME', 'a-change-me-token'])
 def test_other_tokens_are_not_placeholders(token):
     assert is_placeholder_token(token) is False
+
+
+# === Audit (task 21): token loading, brute-force limiter, Origin, stop flood ============
+# SECURITY: these tests fix the SAFE behaviour. No sleeping: every clock is injected.
+
+SENTINEL = 'SENTINEL-9f3c2a7b-do-not-leak-0042'   # unique secret: must never appear anywhere
+
+
+def _write(path, content, mode=0o600):
+    data = content.encode() if isinstance(content, str) else content
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.chmod(str(path), mode)
+    return str(path)
+
+
+def _everything_printable(err):
+    """Return what logs and tracebacks show: str/repr/args of `err` and the formatted chain."""
+    return ' '.join([str(err), repr(err), repr(err.args), ''.join(
+        traceback.format_exception(type(err), err, err.__traceback__))])
+
+
+def _assert_no_cause_chain_leak(err, with_context=False):
+    """`raise ... from None`: no explicit cause, context hidden, nothing leaks the SENTINEL."""
+    assert err.__cause__ is None
+    assert err.__suppress_context__ is True
+    assert SENTINEL not in _everything_printable(err)
+    if with_context:
+        link = err.__context__
+        assert link is None or SENTINEL not in (
+            repr(link) + repr(link.args) + str(link))
+
+
+# --- read_token_file ------------------------------------------------------------------
+
+def test_token_file_absent_returns_none(tmp_path):
+    assert read_token_file(str(tmp_path / 'missing')) is None
+
+
+@pytest.mark.parametrize('mode', [0o600, 0o400])
+def test_token_file_private_modes_are_accepted(tmp_path, mode):
+    path = _write(tmp_path / 'tok', 'a-valid-token-value', mode)
+    assert read_token_file(path) == 'a-valid-token-value'
+
+
+@pytest.mark.parametrize('mode', [0o644, 0o640, 0o604, 0o660, 0o606, 0o620, 0o602, 0o777])
+def test_token_file_with_group_or_other_access_is_refused(tmp_path, mode):
+    path = _write(tmp_path / 'tok', SENTINEL, mode)
+    with pytest.raises(TokenError) as info:
+        read_token_file(path)
+    assert 'chmod 600' in str(info.value)
+    assert SENTINEL not in _everything_printable(info.value)
+
+
+def test_token_file_trailing_newlines_and_spaces_are_stripped(tmp_path):
+    path = _write(tmp_path / 'tok', '  tok-with-newline-xyz \r\n\n')
+    assert read_token_file(path) == 'tok-with-newline-xyz'
+
+
+def test_token_file_empty_returns_empty_string(tmp_path):
+    assert read_token_file(_write(tmp_path / 'tok', '')) == ''
+    assert read_token_file(_write(tmp_path / 'tok2', ' \n\t\n')) == ''
+
+
+def test_token_file_of_exactly_the_maximum_size_is_accepted(tmp_path):
+    assert read_token_file(_write(tmp_path / 'tok', 'a' * TOKEN_FILE_MAX_BYTES)) == (
+        'a' * TOKEN_FILE_MAX_BYTES)
+
+
+def test_token_file_larger_than_1024_bytes_is_refused_without_leaking(tmp_path):
+    path = _write(tmp_path / 'tok', SENTINEL + 'a' * TOKEN_FILE_MAX_BYTES)
+    with pytest.raises(TokenError) as info:
+        read_token_file(path)
+    assert 'too large' in str(info.value)
+    assert SENTINEL not in _everything_printable(info.value)
+
+
+def test_token_file_with_invalid_utf8_is_refused_without_leaking(tmp_path):
+    path = _write(tmp_path / 'tok', SENTINEL.encode() + b'\xff\xfe\x80')
+    with pytest.raises(TokenError) as info:
+        read_token_file(path)
+    assert 'UTF-8' in str(info.value)
+    assert SENTINEL not in _everything_printable(info.value)
+
+
+def test_token_file_invalid_utf8_cause_chain_does_not_carry_the_content(tmp_path):
+    path = _write(tmp_path / 'tok', SENTINEL.encode() + b'\xff\xfe\x80')
+    with pytest.raises(TokenError) as info:
+        read_token_file(path)
+    _assert_no_cause_chain_leak(info.value)
+
+
+def test_token_file_symlink_is_refused_even_to_a_private_file(tmp_path):
+    target = _write(tmp_path / 'real', SENTINEL)
+    link = tmp_path / 'link'
+    os.symlink(target, link)
+    with pytest.raises(TokenError) as info:
+        read_token_file(str(link))
+    assert 'regular file' in str(info.value)
+    assert SENTINEL not in _everything_printable(info.value)
+
+
+def test_token_file_dangling_symlink_is_refused_not_treated_as_absent(tmp_path):
+    link = tmp_path / 'link'
+    os.symlink(tmp_path / 'nowhere', link)
+    with pytest.raises(TokenError):
+        read_token_file(str(link))
+
+
+def test_token_file_directory_is_refused(tmp_path):
+    directory = tmp_path / 'dir'
+    directory.mkdir(mode=0o700)
+    with pytest.raises(TokenError) as info:
+        read_token_file(str(directory))
+    assert 'regular file' in str(info.value)
+
+
+def test_token_file_fifo_is_refused_without_blocking(tmp_path):
+    fifo = tmp_path / 'fifo'
+    os.mkfifo(fifo, 0o600)
+    with pytest.raises(TokenError) as info:
+        read_token_file(str(fifo))
+    assert 'regular file' in str(info.value)
+
+
+def test_token_file_owned_by_another_user_is_refused(tmp_path, monkeypatch):
+    path = _write(tmp_path / 'tok', SENTINEL)
+    real_euid = os.geteuid()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, 'geteuid', lambda: real_euid + 1)
+        with pytest.raises(TokenError) as info:
+            read_token_file(path)
+    assert 'owned by the user' in str(info.value)
+    assert SENTINEL not in _everything_printable(info.value)
+
+
+def test_token_file_owner_is_taken_from_the_opened_descriptor(tmp_path, monkeypatch):
+    path = _write(tmp_path / 'tok', SENTINEL)
+    real = os.fstat
+
+    def foreign(fd):
+        info = real(fd)
+        return types.SimpleNamespace(st_mode=info.st_mode, st_uid=info.st_uid + 1)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, 'fstat', foreign)
+        with pytest.raises(TokenError, match='owned by the user'):
+            read_token_file(path)
+
+
+def test_token_file_read_error_message_has_no_content(tmp_path, monkeypatch):
+    path = _write(tmp_path / 'tok', SENTINEL)
+
+    def boom(fd, size):
+        raise OSError(5, 'I/O error')
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, 'read', boom)
+        with pytest.raises(TokenError) as info:
+            read_token_file(path)
+    assert SENTINEL not in _everything_printable(info.value)
+
+
+@pytest.mark.parametrize('path', ['relative/token', 'token', './token', '', None, 42,
+                                  '~nonexistent_user_zzz9/token'])
+def test_token_file_path_must_be_absolute(path):
+    with pytest.raises(TokenError, match='must be an absolute path'):
+        read_token_file(path)
+
+
+def test_token_file_tilde_is_expanded_to_the_home_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv('HOME', str(tmp_path))
+    _write(tmp_path / 'tok', 'tilde-expanded-token')
+    assert read_token_file('~/tok') == 'tilde-expanded-token'
+
+
+def test_token_file_opened_with_nofollow_flag(tmp_path, monkeypatch):
+    path = _write(tmp_path / 'tok', 'a-valid-token-value')
+    flags = []
+    real = os.open
+
+    def spy(p, f, *args, **kwargs):
+        flags.append(f)
+        return real(p, f, *args, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, 'open', spy)
+        read_token_file(path)
+    assert flags and all(f & os.O_NOFOLLOW for f in flags)
+
+
+# --- load_token -----------------------------------------------------------------------
+
+def test_load_token_environment_has_priority_over_the_file(tmp_path):
+    path = _write(tmp_path / 'tok', 'from-the-file-xxxxxxxxxxxx')
+    assert load_token(path, {'MTRB_WEB_TOKEN': 'from-env-xxxxxxxxxxxxxxxx'}) == (
+        'from-env-xxxxxxxxxxxxxxxx')
+
+
+def test_load_token_environment_value_is_stripped():
+    assert load_token('/nonexistent/x', {'MTRB_WEB_TOKEN': '  \tenv-token-padded \n'}) == (
+        'env-token-padded')
+
+
+def test_load_token_environment_present_never_touches_an_unsafe_file(tmp_path):
+    path = _write(tmp_path / 'tok', SENTINEL, 0o644)   # would raise if it were read
+    assert load_token(path, {'MTRB_WEB_TOKEN': 'env-token-wins'}) == 'env-token-wins'
+
+
+@pytest.mark.parametrize('value', ['', '   ', '\n\t'])
+def test_load_token_blank_environment_falls_back_to_the_file(tmp_path, value):
+    path = _write(tmp_path / 'tok', 'from-the-file\n')
+    assert load_token(path, {'MTRB_WEB_TOKEN': value}) == 'from-the-file'
+
+
+def test_load_token_uses_the_process_environment_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv('MTRB_WEB_TOKEN', 'process-env-token')
+    assert load_token(str(tmp_path / 'missing')) == 'process-env-token'
+
+
+def test_load_token_without_any_source_returns_empty_string(tmp_path):
+    assert load_token(str(tmp_path / 'missing'), {}) == ''
+
+
+def test_load_token_empty_file_returns_empty_string(tmp_path):
+    assert load_token(_write(tmp_path / 'tok', '\n'), {}) == ''
+
+
+def test_load_token_unsafe_file_raises_token_error_without_leaking(tmp_path):
+    path = _write(tmp_path / 'tok', SENTINEL, 0o666)
+    with pytest.raises(TokenError) as info:
+        load_token(path, {})
+    assert SENTINEL not in _everything_printable(info.value)
+
+
+def test_load_token_bad_path_raises_token_error():
+    with pytest.raises(TokenError, match='absolute'):
+        load_token('relative/token', {})
+
+
+def test_token_constants_are_the_audited_ones():
+    assert TOKEN_MIN_LENGTH == 20
+    assert TOKEN_FILE_MAX_BYTES == 1024
+    assert TOKEN_ENV_VAR == 'MTRB_WEB_TOKEN'
+    assert DEFAULT_TOKEN_FILE == '~/.config/mtrb/web_token'
+    assert (AUTH_MAX_FAILURES, AUTH_WINDOW_S, AUTH_BLOCK_S) == (10, 60.0, 60.0)
+    assert AUTH_MAX_TRACKED_IPS == 1024
+
+
+# --- is_weak_token ----------------------------------------------------------------------
+
+@pytest.mark.parametrize('token', [
+    'CHANGE-ME', 'change-me-' + 'x' * 30, 'Change-Me-please-0123456789', '  cHaNgE-mE',
+    'a' * 19, 'abcdefghijklmnopqrs', '', '   ', '\n\t ', 'a' * 20, 'a' * 64, ' ' * 20,
+    '0' * 40, 'ab' * 5, '  ' + 'z' * 18 + '  '])
+def test_weak_tokens_are_detected(token):
+    assert is_weak_token(token) is True
+
+
+@pytest.mark.parametrize('token', [
+    'abcdefghijklmnopqrst', 'a' * 19 + 'b', 'aaaaaaaaaaaaaaaaaaab', 'S3cr3t-Value-0123456789',
+    '  abcdefghijklmnopqrst  ', 'x1' * 10, 'a-random-token-of-24-chars'])
+def test_varied_tokens_of_at_least_20_characters_are_strong(token):
+    assert is_weak_token(token) is False
+
+
+def test_a_token_of_19_varied_characters_is_weak_and_of_20_is_strong():
+    assert is_weak_token('abcdefghijklmnopqrs') is True      # 19
+    assert is_weak_token('abcdefghijklmnopqrst') is False    # 20
+
+
+# --- AuthFailureLimiter -----------------------------------------------------------------
+
+class Clock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def _fail(limiter, ip, times):
+    return [limiter.record_failure(ip) for _ in range(times)]
+
+
+def test_limiter_blocks_exactly_at_the_tenth_failure():
+    limiter = AuthFailureLimiter(clock=Clock())
+    results = _fail(limiter, '10.0.0.1', 9)
+    assert results == [False] * 9
+    assert limiter.blocked('10.0.0.1') is False
+    assert limiter.record_failure('10.0.0.1') is True       # failure no. 10
+    assert limiter.blocked('10.0.0.1') is True
+    assert limiter.record_failure('10.0.0.1') is True       # failure no. 11
+    assert limiter.blocked('10.0.0.1') is True
+
+
+def test_limiter_block_lasts_60_seconds_and_is_not_extended_by_more_failures():
+    clock = Clock()
+    limiter = AuthFailureLimiter(clock=clock)
+    _fail(limiter, 'a', 10)
+    clock.now += 59.0
+    _fail(limiter, 'a', 5)                  # attempts while blocked do not extend the block
+    assert limiter.blocked('a') is True
+    clock.now += 1.0                        # 60 s after the block started
+    assert limiter.blocked('a') is False
+    assert limiter.record_failure('a') is False   # fresh count after the block
+
+
+def test_limiter_failures_expire_after_the_window():
+    clock = Clock()
+    limiter = AuthFailureLimiter(clock=clock)
+    _fail(limiter, 'a', 9)
+    clock.now += 60.0                       # window over: the 9 failures are forgotten
+    assert _fail(limiter, 'a', 9) == [False] * 9
+    assert limiter.blocked('a') is False
+    assert limiter.record_failure('a') is True
+
+
+def test_limiter_failures_inside_the_window_still_count():
+    clock = Clock()
+    limiter = AuthFailureLimiter(clock=clock)
+    _fail(limiter, 'a', 9)
+    clock.now += 59.9
+    assert limiter.record_failure('a') is True
+
+
+def test_limiter_window_restarts_after_expiry():
+    clock = Clock()
+    limiter = AuthFailureLimiter(clock=clock)
+    _fail(limiter, 'a', 5)
+    clock.now += 61.0
+    assert _fail(limiter, 'a', 4) == [False] * 4     # new window: count 4
+    clock.now += 30.0                                # 30 s into the NEW window
+    assert limiter.record_failure('a') is False      # 5th of the new window
+    clock.now += 31.0                                # 61 s since the new window began
+    assert _fail(limiter, 'a', 9) == [False] * 9     # forgotten again
+    assert limiter.record_failure('a') is True
+
+
+def test_limiter_blocked_ip_does_not_affect_another_ip():
+    limiter = AuthFailureLimiter(clock=Clock())
+    _fail(limiter, 'bad', 10)
+    assert limiter.blocked('bad') is True
+    assert limiter.blocked('good') is False
+    assert limiter.record_failure('good') is False
+    assert limiter.blocked('good') is False
+
+
+def test_limiter_unknown_ip_is_not_blocked_and_not_tracked():
+    limiter = AuthFailureLimiter(clock=Clock())
+    assert limiter.blocked('never-seen') is False
+    assert len(limiter) == 0
+
+
+def test_limiter_clock_going_back_never_keeps_an_ip_blocked_for_longer():
+    clock = Clock(1000.0)
+    limiter = AuthFailureLimiter(clock=clock)
+    _fail(limiter, 'a', 10)
+    clock.now = 400.0                       # the clock jumped back by 10 minutes
+    assert limiter.blocked('a') is False    # entry discarded, not blocked "for 600 s"
+    _fail(limiter, 'b', 9)
+    clock.now = 100.0
+    assert limiter.record_failure('b') is False     # stale entry dropped: count restarts
+
+
+def test_limiter_table_is_bounded_to_the_default_1024_ips():
+    limiter = AuthFailureLimiter(clock=Clock())
+    for index in range(AUTH_MAX_TRACKED_IPS * 2 + 7):
+        limiter.record_failure(f'10.{index // 256}.{index % 256}.1')
+        assert len(limiter) <= AUTH_MAX_TRACKED_IPS
+    assert len(limiter) == AUTH_MAX_TRACKED_IPS
+
+
+def test_limiter_full_table_drops_expired_entries_before_blocked_ones():
+    clock = Clock(0.0)
+    limiter = AuthFailureLimiter(clock=clock, max_ips=2)
+    _fail(limiter, 'attacker', 9)
+    clock.now = 10.0
+    limiter.record_failure('victim-of-expiry')      # created later, expires first
+    clock.now = 50.0
+    assert limiter.record_failure('attacker') is True    # blocked until t=110
+    clock.now = 75.0                                # 'victim-of-expiry' (t=10) is stale
+    limiter.record_failure('newcomer')              # table full -> make room
+    assert len(limiter) == 2
+    assert limiter.blocked('attacker') is True      # the block survived the eviction
+
+
+def test_limiter_full_table_evicts_the_oldest_when_nothing_expired():
+    clock = Clock(0.0)
+    limiter = AuthFailureLimiter(clock=clock, max_ips=3)
+    for ip in ('oldest', 'middle', 'newest'):
+        _fail(limiter, ip, 9)
+        clock.now += 1.0
+    limiter.record_failure('newcomer')              # nothing expired: 'oldest' is dropped
+    assert len(limiter) == 3
+    assert limiter.record_failure('oldest') is False      # its 9 failures were forgotten
+    assert limiter.record_failure('newest') is True       # still tracked: 10th failure
+
+
+def test_limiter_valid_requests_never_create_entries():
+    limiter = AuthFailureLimiter(clock=Clock())
+    app = create_app(StateStore(), TOKEN, auth_limiter=limiter)
+    client = TestClient(app)
+    for _ in range(40):
+        assert client.get('/api/state', headers=AUTH).status_code == 200
+    assert len(limiter) == 0
+
+
+# --- brute force over REST --------------------------------------------------------------
+
+BAD = {'Authorization': f'Bearer wrong-{SENTINEL}'}
+
+
+def _limited_app(limiter=None, nav=None, on_event=None, **kwargs):
+    limiter = AuthFailureLimiter(clock=Clock()) if limiter is None else limiter
+    app = create_app(StateStore(), TOKEN, auth_limiter=limiter, nav_port=nav,
+                     on_event=on_event, **kwargs)
+    return app, limiter
+
+
+def test_failure_number_10_gets_401_and_number_11_gets_429_with_retry_after():
+    app, _ = _limited_app()
+    client = TestClient(app)
+    statuses = [client.get('/api/state', headers=BAD).status_code for _ in range(12)]
+    assert statuses == [401] * 10 + [429] * 2
+    response = client.get('/api/state', headers=BAD)
+    assert response.status_code == 429
+    assert response.headers['retry-after'] == '60'
+    assert response.json()['error'] == 'too_many_attempts'
+    assert 'www-authenticate' not in response.headers
+
+
+def test_valid_token_from_a_blocked_ip_gets_429_on_every_rest_endpoint():
+    app, limiter = _limited_app(nav=FakeNav())
+    client = TestClient(app)
+    for _ in range(10):
+        client.get('/api/state', headers=BAD)
+    assert limiter.blocked('testclient')
+    for method, path in (('get', '/api/state'), ('post', '/api/goal'), ('post', '/api/cancel'),
+                         ('post', '/api/dock'), ('post', '/api/initialpose'),
+                         ('post', '/api/map/save'), ('get', '/api/maps')):
+        response = getattr(client, method)(path, headers=AUTH)
+        assert response.status_code == 429, path
+        assert response.headers['retry-after'] == '60'
+
+
+def test_blocked_ip_is_released_after_60_seconds():
+    clock = Clock()
+    app, _ = _limited_app(AuthFailureLimiter(clock=clock))
+    client = TestClient(app)
+    for _ in range(10):
+        client.get('/api/state', headers=BAD)
+    assert client.get('/api/state', headers=AUTH).status_code == 429
+    clock.now += 59.0
+    assert client.get('/api/state', headers=AUTH).status_code == 429
+    clock.now += 1.0
+    assert client.get('/api/state', headers=AUTH).status_code == 200
+
+
+def test_another_ip_is_not_affected_by_a_blocked_one():
+    app, _ = _limited_app()
+    attacker = TestClient(app, client=('203.0.113.9', 4000))
+    friend = TestClient(app, client=('192.168.1.20', 4001))
+    for _ in range(11):
+        attacker.get('/api/state', headers=BAD)
+    assert attacker.get('/api/state', headers=AUTH).status_code == 429
+    assert friend.get('/api/state', headers=AUTH).status_code == 200
+    assert friend.get('/api/state', headers=BAD).status_code == 401
+
+
+def test_x_forwarded_for_is_ignored_the_socket_peer_is_what_counts():
+    app, limiter = _limited_app()
+    client = TestClient(app)
+    for index in range(10):         # the attacker rotates fake forwarded addresses
+        response = client.get('/api/state', headers={**BAD, 'X-Forwarded-For': f'9.9.9.{index}',
+                                                     'X-Real-IP': f'8.8.8.{index}'})
+        assert response.status_code == 401
+    assert limiter.blocked('testclient') is True
+    assert len(limiter) == 1
+    response = client.get('/api/state', headers={**AUTH, 'X-Forwarded-For': '1.2.3.4'})
+    assert response.status_code == 429
+
+
+def test_a_forwarded_header_cannot_borrow_the_identity_of_a_clean_ip():
+    app, limiter = _limited_app()
+    client = TestClient(app, client=('203.0.113.9', 4000))
+    for _ in range(10):
+        client.get('/api/state', headers=BAD)
+    response = client.get('/api/state', headers={**AUTH, 'X-Forwarded-For': '192.168.1.20'})
+    assert response.status_code == 429
+
+
+def test_only_failures_feed_the_limiter_valid_requests_in_between_do_not_reset_it():
+    app, limiter = _limited_app()
+    client = TestClient(app)
+    for _ in range(9):
+        client.get('/api/state', headers=BAD)
+        assert client.get('/api/state', headers=AUTH).status_code == 200
+    assert limiter.blocked('testclient') is False
+    assert client.get('/api/state', headers=BAD).status_code == 401    # the 10th failure
+    assert limiter.blocked('testclient') is True
+
+
+def test_missing_authorization_header_counts_as_a_failure():
+    app, _ = _limited_app()
+    client = TestClient(app)
+    assert [client.get('/api/state').status_code for _ in range(11)] == [401] * 10 + [429]
+
+
+def test_invalid_token_from_a_blocked_ip_is_429_and_does_not_extend_the_block():
+    clock = Clock()
+    app, _ = _limited_app(AuthFailureLimiter(clock=clock))
+    client = TestClient(app)
+    for _ in range(10):
+        client.get('/api/state', headers=BAD)
+    clock.now += 30.0
+    assert client.get('/api/state', headers=BAD).status_code == 429
+    clock.now += 30.0                        # 60 s after the block began
+    assert client.get('/api/state', headers=AUTH).status_code == 200
+
+
+def test_the_default_limiter_is_created_when_none_is_given():
+    client = TestClient(create_app(StateStore(), TOKEN))
+    statuses = [client.get('/api/state', headers=BAD).status_code for _ in range(11)]
+    assert statuses == [401] * 10 + [429]
+
+
+def test_auth_logs_are_summarised_and_never_contain_ip_token_or_authorization():
+    events = []
+    app, _ = _limited_app(on_event=lambda level, text: events.append((level, text)))
+    client = TestClient(app, client=('203.0.113.77', 4444))
+    for _ in range(25):
+        client.get('/api/state', headers=BAD)
+    client.get('/api/state', headers=AUTH)
+    assert 1 <= len(events) <= 3         # a flood is one line per period, not one per attempt
+    for level, text in events:
+        assert level == 'warning'
+        for secret in ('203.0.113.77', SENTINEL, TOKEN, 'Bearer', 'Authorization',
+                       'testclient', 'wrong'):
+            assert secret not in text
+    assert any('failed authentication' in text for _, text in events)
+    assert any('too many failed tokens' in text for _, text in events)
+
+
+# --- the stop exception ---------------------------------------------------------------------
+
+def _blocked_stop_app(nav=None):
+    nav = FakeTeleopNav() if nav is None else nav
+    app, limiter = _limited_app(nav=nav)
+    client = TestClient(app)
+    for _ in range(10):
+        client.get('/api/state', headers=BAD)
+    assert limiter.blocked('testclient')
+    return client, nav, limiter
+
+
+def test_stop_with_a_valid_token_always_passes_even_from_a_blocked_ip():
+    client, nav, _ = _blocked_stop_app()
+    for _ in range(3):
+        response = client.post('/api/stop', headers=AUTH)
+        assert response.status_code == 200
+        assert response.json() == {'ok': True}
+    assert nav.calls == [('stop',)] * 3
+
+
+def test_stop_with_an_invalid_token_from_a_blocked_ip_is_429_and_does_not_stop():
+    client, nav, _ = _blocked_stop_app()
+    response = client.post('/api/stop', headers=BAD)
+    assert response.status_code == 429
+    assert response.headers['retry-after'] == '60'
+    assert nav.calls == []
+
+
+def test_stop_without_a_token_from_a_blocked_ip_is_429_and_does_not_stop():
+    client, nav, _ = _blocked_stop_app()
+    assert client.post('/api/stop').status_code == 429
+    assert nav.calls == []
+
+
+def test_stop_with_an_invalid_token_from_a_clean_ip_is_401_and_feeds_the_limiter():
+    nav = FakeTeleopNav()
+    app, limiter = _limited_app(nav=nav)
+    client = TestClient(app)
+    assert [client.post('/api/stop', headers=BAD).status_code for _ in range(11)] == (
+        [401] * 10 + [429])
+    assert nav.calls == []
+    assert limiter.blocked('testclient') is True
+
+
+def test_valid_stops_never_feed_the_limiter():
+    nav = FakeTeleopNav()
+    app, limiter = _limited_app(nav=nav)
+    client = TestClient(app)
+    for _ in range(50):
+        assert client.post('/api/stop', headers=AUTH).status_code == 200
+    assert len(limiter) == 0
+    assert len(nav.calls) == 50
+
+
+def test_the_stop_exception_does_not_open_any_other_endpoint_for_a_blocked_ip():
+    client, nav, _ = _blocked_stop_app()
+    assert client.post('/api/cancel', headers=AUTH).status_code == 429
+    assert client.get('/api/state', headers=AUTH).status_code == 429
+    assert client.post('/api/stop', headers=AUTH).status_code == 200
+
+
+def test_the_stop_dependency_and_handler_run_on_the_event_loop_not_in_the_thread_pool():
+    app, _ = _limited_app(nav=FakeTeleopNav())
+    route = next(r for r in app.routes if getattr(r, 'path', '') == '/api/stop')
+    assert inspect.iscoroutinefunction(route.endpoint)
+    dependencies = [d.call for d in route.dependant.dependencies]
+    assert dependencies and all(inspect.iscoroutinefunction(call) for call in dependencies)
+    state = next(r for r in app.routes if getattr(r, 'path', '') == '/api/state')
+    assert all(inspect.iscoroutinefunction(d.call) for d in state.dependant.dependencies)
+
+
+def test_a_rest_stop_never_waits_for_the_thread_pool(monkeypatch):
+    import anyio.to_thread
+    calls = []
+    real = anyio.to_thread.run_sync
+
+    async def spy(func, *args, **kwargs):
+        calls.append(getattr(func, '__name__', repr(func)))
+        return await real(func, *args, **kwargs)
+
+    monkeypatch.setattr(anyio.to_thread, 'run_sync', spy)
+    app, _ = _limited_app(nav=FakeTeleopNav())
+    client = TestClient(app)
+    assert client.post('/api/stop', headers=AUTH).status_code == 200
+    assert calls == []
+    client.post('/api/cancel', headers=AUTH)     # control: a sync handler does use the pool
+    assert calls, 'the detector would not notice a thread pool hop'
+
+
+# --- WebSocket: Origin, token and lock are decided BEFORE accept -----------------------------
+
+def _ws_scope(query='', headers=(), client=('10.1.1.1', 5000)):
+    return {'type': 'websocket', 'path': '/ws', 'raw_path': b'/ws', 'root_path': '',
+            'scheme': 'ws', 'query_string': query.encode(), 'subprotocols': [],
+            'headers': [(k.lower().encode(), v.encode()) for k, v in headers],
+            'client': client, 'server': ('robot', 8080), 'asgi': {'version': '3.0'}}
+
+
+def _handshake(app, query='', headers=(), client=('10.1.1.1', 5000)):
+    """Run one WebSocket handshake at ASGI level; return the messages the app sent."""
+    sent = []
+    incoming = [{'type': 'websocket.connect'}]
+
+    async def receive():
+        if incoming:
+            return incoming.pop(0)
+        return {'type': 'websocket.disconnect', 'code': 1000}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app(_ws_scope(query, headers, client), receive, send))
+    return sent
+
+
+def _accepted(sent):
+    return any(m['type'] == 'websocket.accept' for m in sent)
+
+
+def _refused_before_accept(sent):
+    return (bool(sent) and not _accepted(sent) and sent[0]['type'] == 'websocket.close'
+            and sent[0].get('code') == 1008)
+
+
+def _ws_app_limited(limiter=None, **kwargs):
+    from mtrb_bringup.web_server import BroadcastHub
+    limiter = AuthFailureLimiter(clock=Clock()) if limiter is None else limiter
+    hub = BroadcastHub()
+    return create_app(StateStore(), TOKEN, hub=hub, auth_limiter=limiter, **kwargs), hub, limiter
+
+
+GOOD_Q = f'token={TOKEN}'
+
+
+@pytest.mark.parametrize('query', ['', 'token=', 'token=wrong', f'token={TOKEN}x',
+                                   f'token={TOKEN[:-1]}'])
+def test_ws_bad_token_is_refused_before_accept_never_accept_then_1008(query):
+    app, hub, _ = _ws_app_limited()
+    sent = _handshake(app, query, [('host', 'robot:8080')])
+    assert _refused_before_accept(sent), sent
+    assert hub.client_count == 0
+
+
+def test_ws_valid_token_is_accepted_positive_control():
+    app, hub, _ = _ws_app_limited()
+    sent = _handshake(app, GOOD_Q, [('host', 'robot:8080')])
+    assert sent[0]['type'] == 'websocket.accept'
+
+
+@pytest.mark.parametrize('origin,host', [
+    ('http://robot:8080', 'robot:8080'),
+    ('http://ROBOT:8080', 'robot:8080'),
+    ('http://robot', 'robot'),
+    ('http://robot:80', 'robot'),
+    ('http://robot', 'robot:80'),
+    ('https://robot', 'robot'),
+    ('https://robot:443', 'robot'),
+    ('https://robot', 'robot:443'),
+    ('http://192.168.1.50:8080', '192.168.1.50:8080'),
+    ('http://[::1]:8080', '[::1]:8080')])
+def test_ws_origin_equal_to_host_is_accepted(origin, host):
+    app, _, _ = _ws_app_limited()
+    sent = _handshake(app, GOOD_Q, [('host', host), ('origin', origin)])
+    assert sent[0]['type'] == 'websocket.accept', (origin, host)
+
+
+def test_ws_without_origin_header_is_accepted_non_browser_client():
+    app, _, _ = _ws_app_limited()
+    assert _handshake(app, GOOD_Q, [('host', 'robot:8080')])[0]['type'] == 'websocket.accept'
+
+
+@pytest.mark.parametrize('origin,host', [
+    ('http://evil.example', 'robot:8080'),
+    ('http://robot:9999', 'robot:8080'),
+    ('http://robot', 'robot:8080'),               # port 80 vs 8080
+    ('http://robot:8080', 'robot'),               # 8080 vs default 80
+    ('https://robot', 'robot:80'),                # 443 vs 80
+    ('http://robot:443', 'robot'),                # 443 vs 80
+    ('http://robot.evil.example', 'robot:8080'),
+    ('http://evil.example/robot:8080', 'robot:8080'),
+    ('http://robot:8080@evil.example', 'robot:8080'),
+    ('http://user@robot:8080', 'robot:8080'),
+    ('null', 'robot:8080'),
+    ('NULL', 'robot:8080'),
+    ('', 'robot:8080'),
+    ('robot:8080', 'robot:8080'),                 # no scheme
+    ('//robot:8080', 'robot:8080'),
+    ('file:///etc/passwd', 'robot:8080'),
+    ('ftp://robot:8080', 'robot:8080'),
+    ('ws://robot:8080', 'robot:8080'),
+    ('chrome-extension://abcdef', 'robot:8080'),
+    ('http://robot:notaport', 'robot:8080'),
+    ('http://robot:8080', 'robot:notaport')])
+def test_ws_foreign_or_malformed_origin_is_refused_before_accept(origin, host):
+    app, hub, _ = _ws_app_limited()
+    sent = _handshake(app, GOOD_Q, [('host', host), ('origin', origin)])
+    assert _refused_before_accept(sent), (origin, host, sent)
+    assert hub.client_count == 0
+
+
+def test_ws_origin_without_host_header_is_refused_before_accept():
+    app, _, _ = _ws_app_limited()
+    sent = _handshake(app, GOOD_Q, [('origin', 'http://robot:8080')])
+    assert _refused_before_accept(sent), sent
+
+
+def test_ws_foreign_origin_with_a_bad_token_is_refused_before_accept():
+    app, _, _ = _ws_app_limited()
+    sent = _handshake(app, 'token=wrong', [('host', 'robot:8080'),
+                                           ('origin', 'http://evil.example')])
+    assert _refused_before_accept(sent)
+
+
+def test_ws_foreign_origin_does_not_leak_through_a_valid_token_in_the_url():
+    events = []
+    app, _, _ = _ws_app_limited(on_event=lambda level, text: events.append(text))
+    _handshake(app, GOOD_Q, [('host', 'robot:8080'), ('origin', 'http://evil.example')])
+    assert events and all(TOKEN not in t and 'evil.example' not in t for t in events)
+
+
+def test_ws_valid_token_from_a_blocked_ip_is_refused_before_accept():
+    app, hub, limiter = _ws_app_limited()
+    for _ in range(10):
+        limiter.record_failure('10.1.1.1')
+    sent = _handshake(app, GOOD_Q, [('host', 'robot:8080')])
+    assert _refused_before_accept(sent), sent
+    assert hub.client_count == 0
+
+
+def test_ws_invalid_token_from_a_blocked_ip_is_refused_before_accept_and_not_counted():
+    clock = Clock()
+    app, _, limiter = _ws_app_limited(AuthFailureLimiter(clock=clock))
+    for _ in range(10):
+        limiter.record_failure('10.1.1.1')
+    assert _refused_before_accept(_handshake(app, 'token=wrong', [('host', 'robot:8080')]))
+    clock.now += 60.0       # the block was NOT extended by the refused attempt
+    assert _handshake(app, GOOD_Q, [('host', 'robot:8080')])[0]['type'] == 'websocket.accept'
+
+
+def test_ws_blocked_ip_does_not_block_another_ip():
+    app, _, limiter = _ws_app_limited()
+    for _ in range(10):
+        limiter.record_failure('10.1.1.1')
+    sent = _handshake(app, GOOD_Q, [('host', 'robot:8080')], client=('10.2.2.2', 6000))
+    assert sent[0]['type'] == 'websocket.accept'
+
+
+def test_ws_ten_bad_tokens_block_the_ip_and_the_eleventh_is_refused_with_a_good_one():
+    app, _, limiter = _ws_app_limited()
+    for _ in range(10):
+        assert _refused_before_accept(
+            _handshake(app, 'token=wrong', [('host', 'robot:8080')]))
+    assert limiter.blocked('10.1.1.1') is True
+    assert _refused_before_accept(_handshake(app, GOOD_Q, [('host', 'robot:8080')]))
+
+
+def test_ws_and_rest_share_the_same_failure_budget():
+    app, hub, limiter = _ws_app_limited()
+    client = TestClient(app, client=('10.1.1.1', 5000))
+    for _ in range(5):
+        _handshake(app, 'token=wrong', [('host', 'robot:8080')])
+        client.get('/api/state', headers=BAD)
+    assert limiter.blocked('10.1.1.1') is True
+    assert client.get('/api/state', headers=AUTH).status_code == 429
+
+
+def test_ws_x_forwarded_for_is_ignored():
+    app, _, limiter = _ws_app_limited()
+    for index in range(10):
+        _handshake(app, 'token=wrong', [('host', 'robot:8080'),
+                                        ('x-forwarded-for', f'7.7.7.{index}')],
+                   client=('10.1.1.1', 5000 + index))
+    assert limiter.blocked('10.1.1.1') is True
+    sent = _handshake(app, GOOD_Q, [('host', 'robot:8080'), ('x-forwarded-for', '10.9.9.9')])
+    assert _refused_before_accept(sent)
+    assert _handshake(app, GOOD_Q, [('host', 'robot:8080'), ('x-forwarded-for', '10.1.1.1')],
+                      client=('10.9.9.9', 1))[0]['type'] == 'websocket.accept'
+
+
+def test_ws_accepted_connections_never_feed_the_limiter():
+    app, _, limiter = _ws_app_limited()
+    for _ in range(30):
+        assert _handshake(app, GOOD_Q, [('host', 'robot:8080')])[0]['type'] == (
+            'websocket.accept')
+    assert len(limiter) == 0
+
+
+def test_ws_refusals_are_logged_in_summary_without_ip_token_or_origin():
+    events = []
+    app, _, _ = _ws_app_limited(on_event=lambda level, text: events.append((level, text)))
+    for _ in range(15):
+        _handshake(app, f'token=wrong-{SENTINEL}', [('host', 'robot:8080'),
+                                                    ('origin', 'http://evil.example')],
+                   client=('203.0.113.5', 1))
+    assert 1 <= len(events) <= 3
+    for level, text in events:
+        assert level == 'warning'
+        for secret in ('203.0.113.5', SENTINEL, 'evil.example', 'wrong'):
+            assert secret not in text
+    assert any('Origin' in text for _, text in events)
+
+
+def test_ws_foreign_origin_is_refused_with_the_test_client_too():
+    app, hub, _ = _ws_app_limited()
+    client = TestClient(app)
+    from starlette.websockets import WebSocketDisconnect
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(f'/ws?{GOOD_Q}',
+                                      headers={'origin': 'http://evil.example'}) as ws:
+            ws.receive_text()
+    assert hub.client_count == 0
+    with client.websocket_connect(f'/ws?{GOOD_Q}', headers={'origin': 'http://testserver'}):
+        pass    # same-origin works
+
+
+# === Cause chain of the public errors (raise ... from None) ===============================
+# CLIENT DATA: the exceptions chained to ApiError/TokenError (UnicodeDecodeError, JSONDecodeError,
+# ValueError of the name or goal) keep the body or the value in args/repr. Each site has a
+# factory returning the public exception; two parametrized tests exercise all of them.
+
+def _route(app, path):
+    return next(r for r in app.routes if getattr(r, 'path', None) == path
+                and 'POST' in getattr(r, 'methods', ()))
+
+
+class _FakeRequest:
+    def __init__(self, raw):
+        self.headers = {}
+        self._raw = raw
+
+    async def stream(self):
+        yield self._raw
+
+
+def _carrier(base):
+    """Exception type whose args/repr carry the value but whose str() is a fixed text."""
+    return type('Carrier', (base,), {'__str__': lambda self: 'fixed text'})
+
+
+def _site_token_file(tmp_path, monkeypatch):
+    path = _write(tmp_path / 'tok', SENTINEL.encode() + b'\xff\xfe\x80')
+    with pytest.raises(TokenError) as info:
+        read_token_file(path)
+    return info.value
+
+
+def _read_json_site(raw):
+    def site(tmp_path, monkeypatch):
+        endpoint = _route(create_app(StateStore(), TOKEN), '/api/goal').endpoint
+        reader = inspect.signature(endpoint).parameters['body'].default.dependency
+        with pytest.raises(Exception) as info:
+            asyncio.run(reader(_FakeRequest(raw)))
+        assert info.value.code == 'invalid_json'
+        return info.value
+    return site
+
+
+def _map_name_site(error_type):
+    def site(tmp_path, monkeypatch):
+        from mtrb_bringup import web_server
+
+        def echoing(name):
+            raise _carrier(getattr(web_server, error_type, ValueError))(name)
+
+        monkeypatch.setattr(web_server, 'valid_map_name', echoing)
+        with pytest.raises(web_server.ApiError) as info:
+            web_server._map_save_from_body({'name': SENTINEL})
+        return info.value
+    return site
+
+
+def _map_name_real_site(name):
+    def site(tmp_path, monkeypatch):
+        from mtrb_bringup import web_server
+        with pytest.raises(web_server.ApiError) as info:
+            web_server._map_save_from_body({'name': name})
+        return info.value
+    return site
+
+
+def _echoing_validate_goal(*_args):
+    raise _carrier(ValueError)(SENTINEL)
+
+
+def _goal_site(path, echo):
+    def site(tmp_path, monkeypatch):
+        from mtrb_bringup import web_server
+        if echo:
+            monkeypatch.setattr(web_server, 'validate_goal', _echoing_validate_goal)
+        client, _, _ = _nav_client()
+        endpoint = _route(client.app, path).endpoint
+        x = 5.0 if echo else 9000.0          # 9000 m: valid body, outside the 10 m map
+        with pytest.raises(web_server.ApiError) as info:
+            endpoint(body={'x': x, 'y': 1.0, 'yaw': 0.0})
+        return info.value
+    return site
+
+
+CAUSE_SITES = {
+    'token-file-non-utf8': (_site_token_file, TokenError, None),
+    'json-non-utf8': (_read_json_site(SENTINEL.encode() + b'\xff\xfe\x80'), None,
+                      'invalid_json'),
+    'json-truncated': (_read_json_site(('{"name": "' + SENTINEL).encode()), None,
+                       'invalid_json'),
+    'json-deeply-nested': (_read_json_site(('[' * 990 + SENTINEL).encode()), None,
+                           'invalid_json'),
+    'map-name-weird': (_map_name_real_site(SENTINEL + '/../x'), None, 'invalid_name'),
+    'map-name-reserved': (_map_name_real_site('MAP'), None, 'reserved_name'),
+    'map-name-echoing-validator': (_map_name_site('ValueError'), None, 'invalid_name'),
+    'map-name-reserved-echoing': (_map_name_site('ReservedMapNameError'), None,
+                                  'reserved_name'),
+    'goal-invalid': (_goal_site('/api/goal', True), None, 'invalid_goal'),
+    'goal-outside-map': (_goal_site('/api/goal', False), None, 'invalid_goal'),
+    'pose-invalid': (_goal_site('/api/initialpose', True), None, 'invalid_pose'),
+    'pose-outside-map': (_goal_site('/api/initialpose', False), None, 'invalid_pose'),
+}
+
+
+@pytest.mark.parametrize('site_id', list(CAUSE_SITES))
+def test_public_error_has_no_explicit_cause_and_prints_no_client_data(
+        site_id, tmp_path, monkeypatch):
+    factory, _type, code = CAUSE_SITES[site_id]
+    err = factory(tmp_path, monkeypatch)
+    if code is not None:
+        assert err.code == code
+    _assert_no_cause_chain_leak(err)
+
+
+CONTEXT_LEAKS = {'token-file-non-utf8', 'json-non-utf8', 'map-name-echoing-validator',
+                 'map-name-reserved-echoing', 'goal-invalid', 'pose-invalid'}
+_CONTEXT_BUG = pytest.mark.xfail(strict=True, reason=(
+    'BUG (backend, low): "raise ... from None" inside the except block leaves the original '
+    'exception in err.__context__ (hidden when printing, but reachable; its args/repr carry '
+    'the body/name/token). Fix: raise outside the except block, or clear err.__context__.'))
+
+
+@pytest.mark.parametrize('site_id', [
+    pytest.param(site, marks=_CONTEXT_BUG) if site in CONTEXT_LEAKS else site
+    for site in CAUSE_SITES])
+def test_public_error_context_attribute_does_not_carry_the_client_data(
+        site_id, tmp_path, monkeypatch):
+    err = CAUSE_SITES[site_id][0](tmp_path, monkeypatch)
+    _assert_no_cause_chain_leak(err, with_context=True)

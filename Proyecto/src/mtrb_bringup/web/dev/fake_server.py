@@ -4,7 +4,8 @@ Fake MTRB web bridge for developing the UI without the robot.
 Usage (from Proyecto/src/mtrb_bringup/web/dev):
     python fake_server.py [--port 8080] [--token dev-token] [--mode map|mapping]
                           [--fail none|409|503|401|400|teleop|save409|save503|saveslow|savetimeout|
-                                savebackup|savelimit|savedisk|saveratelimit]
+                                savebackup|savelimit|savedisk|saveratelimit|
+                                initpose400|initpose409|initpose503]
                           [--no-dock] [--maps lab,casa] [--no-posegraph] [--stale]
 --fail makes POST /api/goal, /api/dock and /api/cancel answer that error
 (409 goal_active, 503 nav_unavailable, 401 unauthorized, 400 invalid_goal).
@@ -23,6 +24,10 @@ savebackup -> 409 backup_pending, savelimit -> 409 map_limit, savedisk -> 507
 insufficient_storage, saveratelimit -> 429 save_rate_limited.
 --maps sets the initial saved maps (comma separated; hostile names are allowed to test escaping),
 --no-posegraph makes saves answer posegraph:false, --stale publishes scan_age/odom_age > 2 s.
+--fail initpose400|initpose409|initpose503 make POST /api/initialpose answer 400 invalid_pose,
+409 goal_active or 503 no_map (after body validation).
+Token brute-force limit like the real server: 10 wrong tokens in 60 s from one IP lock that IP
+for 60 s: REST answers 429 too_many_attempts and the WS closes with code 1008.
 The status message carries nodes, scan_age and odom_age like the real server.
 Then open http://localhost:8080/ and enter the token. Not installed with the package.
 """
@@ -67,6 +72,12 @@ def make_map():
     return bytes(cells)
 
 
+AUTH_MAX_FAILS, AUTH_WINDOW_S, AUTH_LOCK_S = 10, 60.0, 60.0
+INIT_FAILS = {
+    'initpose400': (400, 'invalid_pose', 'Pose outside the map'),
+    'initpose409': (409, 'goal_active', 'Navigation or teleop active'),
+    'initpose503': (503, 'no_map', 'No map yet'),
+}
 FAILURES = {
     '409': (409, 'goal_active', 'A goal is already active'),
     '503': (503, 'nav_unavailable', 'Navigation is not available'),
@@ -92,6 +103,34 @@ def _pose_ok(body):
     return (isinstance(body, dict) and set(body) == {'x', 'y', 'yaw'}
             and all(isinstance(v, (int, float)) and not isinstance(v, bool)
                     and math.isfinite(v) for v in body.values()))
+
+
+class AuthLimiter:
+    """Per-IP limit on wrong tokens: AUTH_MAX_FAILS in AUTH_WINDOW_S locks the IP."""
+
+    def __init__(self):
+        """Start with no recorded failures."""
+        self.fails = {}
+        self.locked = {}
+
+    def is_locked(self, ip):
+        """Return True while `ip` is locked out."""
+        return self.locked.get(ip, 0.0) > time.monotonic()
+
+    def record_failure(self, ip):
+        """Count one wrong token from `ip`; lock it when the limit is reached."""
+        now = time.monotonic()
+        recent = [t for t in self.fails.get(ip, []) if now - t < AUTH_WINDOW_S] + [now]
+        self.fails[ip] = recent
+        if len(recent) >= AUTH_MAX_FAILS:
+            self.locked[ip] = now + AUTH_LOCK_S
+            self.fails[ip] = []
+            log('auth lockout for', ip)
+
+
+def _ip(conn):
+    """Return the client IP of a request or websocket."""
+    return conn.client.host if conn.client else '?'
 
 
 def log(*parts):
@@ -142,6 +181,7 @@ def create_app(token, mode='mapping', fail='none', with_dock=True, maps=None,
                posegraph=True, stale=False):
     """Build the fake app serving static files, /api/*, and /ws."""
     app = FastAPI()
+    limiter = AuthLimiter()
     nav = {'state': 'idle', 'distance': None, 'log': []}
     saved = list(maps if maps is not None else ['lab', 'casa'])
     saving = {'busy': False}
@@ -158,19 +198,23 @@ def create_app(token, mode='mapping', fail='none', with_dock=True, maps=None,
     for route, (name, media) in STATIC.items():
         app.add_api_route(route, serve(name, media), methods=['GET'], include_in_schema=False)
 
-    @app.get('/api/state')
-    async def state(request: Request):
-        auth = request.headers.get('authorization', '')
-        if not secrets.compare_digest(auth, 'Bearer ' + token):
-            return JSONResponse({'error': 'unauthorized', 'detail': 'Invalid token'}, 401)
-        return {'mode': mode, 'pose': None, 'map': meta}
-
     def guard(request):
-        """Return an error response for a bad token or the forced failure, else None."""
+        """Return an error response for a locked IP or a bad token, else None."""
+        ip = _ip(request)
+        if limiter.is_locked(ip):
+            return JSONResponse({'error': 'too_many_attempts', 'detail': 'Locked'}, 429)
         auth = request.headers.get('authorization', '')
         if not secrets.compare_digest(auth, 'Bearer ' + token):
+            limiter.record_failure(ip)
             return JSONResponse({'error': 'unauthorized', 'detail': 'Invalid token'}, 401)
         return None
+
+    @app.get('/api/state')
+    async def state(request: Request):
+        bad = guard(request)
+        if bad:
+            return bad
+        return {'mode': mode, 'pose': None, 'map': meta}
 
     def forced(path):
         if fail in FAILURES and path != '/api/initialpose':
@@ -230,6 +274,9 @@ def create_app(token, mode='mapping', fail='none', with_dock=True, maps=None,
             return bad
         if not _pose_ok(await read_body(request)):
             return JSONResponse({'error': 'invalid_body', 'detail': 'Bad body'}, 400)
+        if fail in INIT_FAILS:
+            code, err, detail = INIT_FAILS[fail]
+            return JSONResponse({'error': err, 'detail': detail}, code)
         if mode != 'map':
             return JSONResponse({'error': 'wrong_mode', 'detail': 'Only in mode map'}, 409)
         return {'ok': True}
@@ -285,8 +332,14 @@ def create_app(token, mode='mapping', fail='none', with_dock=True, maps=None,
     @app.websocket('/ws')
     async def ws(websocket: WebSocket):
         given = websocket.query_params.get('token', '')
-        if not secrets.compare_digest(given, token):
+        ip = _ip(websocket)
+        if limiter.is_locked(ip):
+            await websocket.accept()   # accept first so the browser sees close code 1008
             await websocket.close(code=1008)
+            return
+        if not secrets.compare_digest(given, token):
+            limiter.record_failure(ip)
+            await websocket.close(code=1008)   # before accept: handshake rejected (403)
             return
         await websocket.accept()
         await websocket.send_json(meta)
@@ -361,7 +414,7 @@ def main():
     parser.add_argument('--token', default='dev-token')
     parser.add_argument('--mode', choices=('map', 'mapping'), default='mapping')
     parser.add_argument(
-        '--fail', choices=('none', 'teleop') + tuple(FAILURES) + SAVE_FAILS,
+        '--fail', choices=('none', 'teleop') + tuple(FAILURES) + SAVE_FAILS + tuple(INIT_FAILS),
         default='none')
     parser.add_argument('--no-dock', action='store_true')
     parser.add_argument('--maps', default='lab,casa', help='comma separated saved map names')

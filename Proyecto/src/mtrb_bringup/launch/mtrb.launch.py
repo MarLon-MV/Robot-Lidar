@@ -251,7 +251,7 @@ def generate_launch_description():
     def param(name):
         return os.path.join(pkg, 'param', name)
 
-    # web.local.yaml (git-ignored, real token) takes precedence over web.yaml.
+    # web.local.yaml (git-ignored, optional parameter overrides, no token) wins over web.yaml.
     web_params = param('web.local.yaml')
     if not os.path.isfile(web_params):
         web_params = param('web.yaml')
@@ -310,7 +310,7 @@ def generate_launch_description():
             description='Publish the full Create 3 model too (duplicates its tf_static; '
                         'a visualizer only needs the description topic)'),
 
-        # Web UI / REST API (LAN only). Token: web.local.yaml or MTRB_WEB_TOKEN.
+        # Web UI / REST API (LAN only). Token: MTRB_WEB_TOKEN or ~/.config/mtrb/web_token (0600).
         arg('web', default_value='false', description='Start mtrb_web_bridge'),
         arg('web_port', default_value='8080', description='Web bridge port (1024-65535)'),
         arg('web_params_file', default_value=web_params,

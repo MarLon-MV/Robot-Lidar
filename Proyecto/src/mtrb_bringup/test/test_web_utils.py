@@ -1267,3 +1267,41 @@ def test_list_maps_never_inspects_more_than_10000_directory_entries(root, monkey
     assert MAP_SCAN_MAX_ENTRIES == 10000
     assert list_maps(root) == ['inside']
     assert len(consumed) <= MAP_SCAN_MAX_ENTRIES + 1
+
+
+# --- occupancy_to_bytes: list/tuple go through array('b') (audit, task 21) ----------------------
+
+def _raw(packed):
+    return zlib.decompress(packed)
+
+
+def test_list_and_tuple_cells_equal_the_array_b_result_byte_for_byte():
+    from array import array as typed
+    values = [-1, 0, 100, 50, 1, 99]
+    expected = occupancy_to_bytes(typed('b', values), 3, 2)
+    assert occupancy_to_bytes(values, 3, 2) == expected
+    assert occupancy_to_bytes(tuple(values), 3, 2) == expected
+    assert _raw(expected) == typed('b', values).tobytes()
+
+
+def test_cells_outside_int8_take_the_slow_path_masked_to_a_byte_without_raising():
+    packed = occupancy_to_bytes([0, 300, -129, 128], 2, 2)
+    assert _raw(packed) == bytes([0, 300 & 0xFF, (-129) & 0xFF, 128])
+
+
+def test_array_b_input_is_used_as_raw_bytes_without_conversion():
+    from array import array as typed
+    data = typed('b', [-1, 0, 100, 0])
+    assert _raw(occupancy_to_bytes(data, 2, 2)) == bytes([255, 0, 100, 0])
+
+
+@pytest.mark.parametrize('cells', [['a', 0, 0, 0], [None, 0, 0, 0], [[1], 0, 0, 0],
+                                   [float('nan'), 0, 0, 0], [float('inf'), 0, 0, 0]])
+def test_unconvertible_cells_raise_value_error_never_another_exception(cells):
+    with pytest.raises(ValueError):
+        occupancy_to_bytes(cells, 2, 2)
+
+
+@pytest.mark.parametrize('cells', [[True, False, True, False], [1.0, 2.0, 3.0, 4.0]])
+def test_bool_and_integral_float_cells_keep_working_through_the_slow_path(cells):
+    assert _raw(occupancy_to_bytes(cells, 2, 2)) == bytes(int(v) & 0xFF for v in cells)

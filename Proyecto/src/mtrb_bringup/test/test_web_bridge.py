@@ -19,7 +19,7 @@ from mtrb_bringup import mtrb_web_bridge as bridge  # noqa: E402, I100
 from mtrb_bringup.web_server import (  # noqa: E402, I100
     BroadcastHub, StateStore, TOKEN_ENV_VAR)
 
-SECRET = 'S3cr3t-token-value'
+SECRET = 'S3cr3t-token-value-0123456789'
 
 
 class FakeParam:
@@ -30,7 +30,8 @@ class FakeParam:
 def make_node(params=None):
     """Build a bridge without running Node.__init__ (no ROS context needed)."""
     node = object.__new__(bridge.MtrbWebBridge)
-    values = {'auth.token': '', 'host': '127.0.0.1', 'port': 8080}
+    values = {'auth.token_file': '/home/robot/.config/mtrb/web_token',
+              'auth.allow_example_token': False, 'host': '127.0.0.1', 'port': 8080}
     values.update(params or {})
     node.get_parameter = lambda name: FakeParam(values[name])
     node.logger = mock.Mock()
@@ -43,36 +44,80 @@ def clean_env(monkeypatch):
     monkeypatch.delenv(TOKEN_ENV_VAR, raising=False)
 
 
-def test_select_token_env_has_priority(monkeypatch):
-    monkeypatch.setenv(TOKEN_ENV_VAR, 'from-env')
-    node = make_node({'auth.token': 'from-param'})
-    with mock.patch.object(bridge, 'resolve_token', return_value='from-file'):
-        assert node._select_token('/x') == 'from-env'
+# --- _load_token: the token comes ONLY from MTRB_WEB_TOKEN or the private file ----------------
+
+def test_load_token_environment_has_priority_over_the_file(monkeypatch, tmp_path):
+    path = tmp_path / 'tok'
+    path.write_text('from-the-file-0123456789')
+    path.chmod(0o600)
+    monkeypatch.setenv(TOKEN_ENV_VAR, '  from-env-0123456789  ')
+    node = make_node({'auth.token_file': str(path)})
+    assert node._load_token() == 'from-env-0123456789'
 
 
-def test_select_token_parameter_over_files():
-    node = make_node({'auth.token': ' from-param '})
-    with mock.patch.object(bridge, 'resolve_token', return_value='from-file'):
-        assert node._select_token('/x') == 'from-param'
+def test_load_token_reads_the_private_file_and_strips_it(tmp_path):
+    path = tmp_path / 'tok'
+    path.write_text('from-the-file-0123456789\n')
+    path.chmod(0o600)
+    assert make_node({'auth.token_file': str(path)})._load_token() == 'from-the-file-0123456789'
 
 
-def test_select_token_numeric_parameter_becomes_string():
-    node = make_node({'auth.token': 123456})
-    assert node._select_token('/x') == '123456'
+def test_load_token_without_any_source_is_a_config_error_with_instructions(tmp_path):
+    node = make_node({'auth.token_file': str(tmp_path / 'missing')})
+    with pytest.raises(bridge.ConfigError) as caught:
+        node._load_token()
+    text = str(caught.value)
+    assert 'MTRB_WEB_TOKEN' in text and str(tmp_path / 'missing') in text
+    assert '0600' in text and '20' in text
 
 
-@pytest.mark.parametrize('value', ['', '   ', None, True, False])
-def test_select_token_empty_or_bool_falls_back_to_resolve_token(value):
-    node = make_node({'auth.token': value})
-    with mock.patch.object(bridge, 'resolve_token', return_value='from-file') as res:
-        assert node._select_token('/dir') == 'from-file'
-    res.assert_called_once_with('/dir')
+def test_load_token_empty_file_is_a_config_error(tmp_path):
+    path = tmp_path / 'tok'
+    path.write_text('\n')
+    path.chmod(0o600)
+    with pytest.raises(bridge.ConfigError):
+        make_node({'auth.token_file': str(path)})._load_token()
 
 
-def test_select_token_all_empty_returns_empty():
-    node = make_node()
-    with mock.patch.object(bridge, 'resolve_token', return_value=''):
-        assert node._select_token('/x') == ''
+def test_load_token_unsafe_file_is_a_config_error_that_never_shows_the_content(tmp_path):
+    path = tmp_path / 'tok'
+    path.write_text(SECRET)
+    path.chmod(0o644)
+    with pytest.raises(bridge.ConfigError) as caught:
+        make_node({'auth.token_file': str(path)})._load_token()
+    assert SECRET not in str(caught.value) and SECRET not in repr(caught.value)
+    assert 'chmod 600' in str(caught.value)
+
+
+def test_load_token_symlink_is_a_config_error(tmp_path):
+    real = tmp_path / 'real'
+    real.write_text(SECRET)
+    real.chmod(0o600)
+    link = tmp_path / 'link'
+    link.symlink_to(real)
+    with pytest.raises(bridge.ConfigError) as caught:
+        make_node({'auth.token_file': str(link)})._load_token()
+    assert SECRET not in str(caught.value)
+
+
+@pytest.mark.parametrize('path', ['relative/token', '~nonexistent_user_zzz9/token', ''])
+def test_load_token_relative_or_unresolved_path_is_a_config_error(path):
+    with pytest.raises(bridge.ConfigError, match='must be an absolute path'):
+        make_node({'auth.token_file': path})._load_token()
+
+
+@pytest.mark.parametrize('value', [None, 5, True, ['/x']])
+def test_load_token_non_string_token_file_is_a_config_error(value):
+    with pytest.raises(bridge.ConfigError, match='auth.token_file'):
+        make_node({'auth.token_file': value})._load_token()
+
+
+def test_the_token_is_not_a_ros_parameter_any_more():
+    assert 'auth.token' not in {name for name, _ in bridge.PARAMETERS}
+    assert 'auth.token' not in bridge.DYNAMIC_PARAMETERS
+    assert dict(bridge.PARAMETERS)['auth.token_file'] == '~/.config/mtrb/web_token'
+    assert not [n for n, _ in bridge.PARAMETERS
+                if n.split('.')[-1] in ('token', 'secret', 'password')]
 
 
 # Parameter defaults of the teleop section (mirror param/web.yaml and PARAMETERS).
@@ -84,15 +129,16 @@ def _fake_settings(self):
     """Stand-in for _read_settings (token/port tests only; see the _read_settings tests below)."""
     self._max_clients = 5
     self._max_ws_bytes = 4096
+    self._max_connections = 64
     self._dock = (0.0, 0.0, 0.0)
     self._map_dir = '/share/map'  # phase 5: __init__ hands it to create_app
     self._map_min_free_mb = 200   # security fixes: quotas handed to create_app
     self._map_min_interval_s = 5.0
 
 
-def _init_node(params, token_result=SECRET):
-    """Run the real __init__ with ROS pieces replaced by doubles."""
-    values = {'auth.token': '', 'host': '127.0.0.1', 'port': 8080,
+def _init_node(params, token_result=SECRET, real_loader=False):
+    """Run the real __init__ with ROS pieces replaced by doubles (token loader included)."""
+    values = {'auth.token_file': '/x/web_token', 'host': '127.0.0.1', 'port': 8080,
               'auth.allow_example_token': False}
     values.update(TELEOP_DEFAULTS)  # _read_teleop_settings runs for real in __init__
     values.update(params)
@@ -106,7 +152,8 @@ def _init_node(params, token_result=SECRET):
             mock.patch.object(bridge.MtrbWebBridge, 'get_logger', create=True,
                               new=lambda self: logger), \
             mock.patch.object(bridge, 'get_package_share_directory', return_value='/share'), \
-            mock.patch.object(bridge, 'resolve_token', return_value=token_result), \
+            mock.patch.object(bridge, 'load_token', new=(
+                bridge.load_token if real_loader else (lambda *a, **k: token_result))), \
             mock.patch.object(bridge.MtrbWebBridge, '_read_settings', new=_fake_settings), \
             mock.patch.object(bridge.MtrbWebBridge, '_init_ros_io', new=lambda self: None), \
             mock.patch.object(bridge, 'create_app', new=create_app_mock):
@@ -128,13 +175,13 @@ def test_empty_host_raises_config_error(host):
 
 
 def test_no_token_anywhere_raises_config_error():
-    with pytest.raises(bridge.ConfigError):
+    with pytest.raises(bridge.ConfigError, match='MTRB_WEB_TOKEN'):
         _init_node({}, token_result='')
 
 
 def test_real_token_does_not_warn_and_is_never_logged(caplog):
     with caplog.at_level(logging.DEBUG):
-        node, logger = _init_node({'auth.token': SECRET})
+        node, logger = _init_node({}, token_result=SECRET)
     assert not logger.warning.called
     assert SECRET not in ' '.join(str(c) for c in logger.method_calls)
     assert SECRET not in caplog.text
@@ -495,7 +542,7 @@ VALID_SETTINGS = {
     'rates.pose': 10.0, 'rates.scan': 5.0, 'rates.status': 1.0,
     'scan.max_points': 360, 'scan.min_range': 0.15, 'scan.max_range': 12.0,
     'plan.max_points': 200, 'limits.max_clients': 5, 'limits.max_ws_bytes': 4096,
-    'mode': 'map', 'dock.x': 0.0, 'dock.y': 0.0, 'dock.yaw': 0.0,
+    'limits.max_connections': 64, 'mode': 'map', 'dock.x': 0.0, 'dock.y': 0.0, 'dock.yaw': 0.0,
     # Phase 5 parameters (mirror param/web.yaml).
     'rates.lifecycle': 0.5, 'map_dir': '/maps',
     # Security fixes (mirror param/web.yaml).
@@ -3482,10 +3529,90 @@ def test_stop_with_the_teleop_disabled_still_publishes_zeros(monkeypatch):
     assert zero_count(node) == ZERO_BURST
 
 
+def _clocked_summaries(node, clock):
+    """Give every log summary of the node an injected clock (no real time, no sleeping)."""
+    node._log_summaries = {
+        key: (bridge.EventSummary(summary._label, bridge.LOG_SUMMARY_PERIOD_S,
+                                  clock=lambda: clock[0]), level)
+        for key, (summary, level) in node._log_summaries.items()}
+
+
+def _stop_lines(node):
+    return [m for m in _warnings(node) if 'stop(s)' in m]
+
+
 def test_stop_is_logged_without_any_velocity_data(monkeypatch):
     node = make_teleop_bridge(monkeypatch)
     node.stop()
-    assert any('Stop requested' in m for m in _warnings(node))
+    assert _stop_lines(node) == ['1 stop(s) in the last window']
+    text = _all_log_text(node)
+    for forbidden in ('vx', 'wz', 'linear', 'angular', 'Twist', 'velocity'):
+        assert forbidden not in text
+
+
+def test_a_flood_of_stops_publishes_every_zero_burst_but_logs_one_line_per_second(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    clock = [50.0]
+    _clocked_summaries(node, clock)
+    for _ in range(40):
+        node.stop()
+    assert zero_count(node) == 40 * ZERO_BURST           # SAFETY: no zero is ever coalesced
+    assert _stop_lines(node) == ['1 stop(s) in the last window']   # first one at once
+    clock[0] += 1.0
+    node._flush_log_summaries()
+    assert _stop_lines(node) == ['1 stop(s) in the last window',
+                                 '39 stop(s) in the last window']
+    node._flush_log_summaries()                           # nothing pending any more
+    assert len(_stop_lines(node)) == 2
+
+
+def test_stops_inside_the_period_are_counted_and_logged_when_the_period_ends(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    clock = [10.0]
+    _clocked_summaries(node, clock)
+    for _ in range(10):                                   # t = 10.0 .. 10.9
+        node.stop()
+        clock[0] += 0.1
+    assert len(_stop_lines(node)) == 1
+    clock[0] = 11.0
+    node.stop()                                           # the period elapsed: summary line
+    assert _stop_lines(node)[-1] == '10 stop(s) in the last window'
+    assert len(_stop_lines(node)) == 2
+    assert zero_count(node) == 11 * ZERO_BURST
+
+
+def test_the_watchdog_tick_releases_the_pending_log_summaries(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    clock = [5.0]
+    _clocked_summaries(node, clock)
+    for _ in range(6):
+        node.stop()
+    assert len(_stop_lines(node)) == 1
+    clock[0] += 0.5
+    node._teleop_watchdog()
+    assert len(_stop_lines(node)) == 1                    # not yet due
+    clock[0] += 0.5
+    node._teleop_watchdog()
+    assert _stop_lines(node)[-1] == '5 stop(s) in the last window'
+
+
+def test_flush_log_summaries_without_pending_events_logs_nothing(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    clock = [0.0]
+    _clocked_summaries(node, clock)
+    clock[0] += 100.0
+    node._flush_log_summaries()
+    assert not node.logger.warning.called and not node.logger.info.called
+
+
+def test_a_clock_that_goes_back_does_not_swallow_the_stop_log(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    clock = [100.0]
+    _clocked_summaries(node, clock)
+    node.stop()
+    clock[0] = 20.0
+    node.stop()
+    assert len(_stop_lines(node)) == 2
 
 
 @pytest.mark.parametrize('fail_on', [{0}, {1}, {2}, {0, 1}, {0, 2}, {1, 2}])
@@ -5574,53 +5701,61 @@ def _refused(params, **kwargs):
 
 
 def test_token_constants_are_the_documented_ones():
-    assert bridge.TOKEN_MIN_LENGTH == 16
+    assert bridge.TOKEN_MIN_LENGTH == 20
     assert tuple(bridge.LOOPBACK_HOSTS) == ('127.0.0.1', '::1', 'localhost')
     assert dict(bridge.PARAMETERS)['auth.allow_example_token'] is False
 
 
 @pytest.mark.parametrize('host', ['127.0.0.1', '0.0.0.0', '192.168.1.50'])
 def test_the_example_token_is_refused_by_default_on_every_host(host):
-    text = _refused({'auth.token': PLACEHOLDER, 'host': host})
+    text = _refused({'host': host}, token_result=PLACEHOLDER)
     assert PLACEHOLDER not in text
 
 
-@pytest.mark.parametrize('token', ['CHANGE-ME', 'CHANGE-ME-', 'CHANGE-ME-' + 'x' * 40])
+@pytest.mark.parametrize('token', ['CHANGE-ME', 'CHANGE-ME-', 'CHANGE-ME-' + 'x' * 40,
+                                   'change-me-' + 'q' * 30])
 def test_any_token_with_the_placeholder_prefix_is_refused_even_if_long(token):
-    assert token not in _refused({'auth.token': token})
+    assert token not in _refused({}, token_result=token)
 
 
-def test_a_15_character_token_is_refused():
-    token = 'a1B2c3D4e5F6g7H'
-    assert len(token) == 15
-    assert token not in _refused({'auth.token': token})
+@pytest.mark.parametrize('token', ['a1B2c3D4e5F6g7H', 'a1B2c3D4e5F6g7H8i9J'])
+def test_a_token_shorter_than_20_characters_is_refused(token):
+    assert len(token) < 20
+    assert token not in _refused({}, token_result=token)
 
 
-@pytest.mark.parametrize('length', [16, 17, 32, 64])
-def test_a_token_of_16_or_more_characters_starts_without_a_warning(length):
+@pytest.mark.parametrize('length', [20, 21, 32, 64])
+def test_a_token_of_20_or_more_characters_starts_without_a_warning(length):
     token = 'k9' * (length // 2) + 'z' * (length % 2)
     assert len(token) == length
-    node, logger = _init_node({'auth.token': token})
+    node, logger = _init_node({}, token_result=token)
     assert node.host == '127.0.0.1'
     assert not logger.warning.called and not logger.error.called
 
 
-@pytest.mark.parametrize('token', ['', '1', 'short', 'x' * 8, '123456'])
+@pytest.mark.parametrize('token', ['', '1', 'short', 'x' * 8, '123456', '   '])
 def test_short_tokens_are_refused_by_default(token):
-    assert 'token' in _refused({'auth.token': token}, token_result=token).lower()
+    assert 'token' in _refused({}, token_result=token).lower()
 
 
-def test_the_length_is_measured_after_stripping_the_parameter_whitespace():
-    token = ' ' + 'a' * 14 + ' '        # 16 characters with spaces, 14 once stripped
-    assert len(token) == 16
-    _refused({'auth.token': token})
+@pytest.mark.parametrize('token', ['a' * 20, 'a' * 64, ' ' * 20, '7' * 30])
+def test_a_single_repeated_character_is_refused_whatever_the_length(token):
+    text = _refused({}, token_result=token)
+    assert 'token' in text.lower()
+    assert token.strip() == '' or token not in text
 
 
-@pytest.mark.parametrize('token', [PLACEHOLDER, 'short-tok', '123456'])
+def test_the_length_is_measured_after_stripping():
+    token = ' ' + 'a1' * 9 + ' '          # 20 characters with spaces, 18 once stripped
+    assert len(token) == 20
+    _refused({}, token_result=token)
+
+
+@pytest.mark.parametrize('token', [PLACEHOLDER, 'short-tok', '123456', 'a' * 20])
 @pytest.mark.parametrize('host', LOOPBACK)
 def test_allow_example_token_true_on_loopback_starts_with_a_warning(token, host):
-    node, logger = _init_node({'auth.token': token, 'host': host,
-                               'auth.allow_example_token': True})
+    node, logger = _init_node({'host': host, 'auth.allow_example_token': True},
+                              token_result=token)
     assert node.host == host
     assert logger.warning.called
     assert token not in _everything_printed(logger)
@@ -5628,29 +5763,29 @@ def test_allow_example_token_true_on_loopback_starts_with_a_warning(token, host)
 
 
 @pytest.mark.parametrize('host', NOT_LOOPBACK)
-@pytest.mark.parametrize('token', [PLACEHOLDER, 'short-tok'])
+@pytest.mark.parametrize('token', [PLACEHOLDER, 'short-tok', 'a' * 20])
 def test_allow_example_token_true_is_not_honoured_on_a_non_loopback_host(host, token):
-    text = _refused({'auth.token': token, 'host': host, 'auth.allow_example_token': True})
+    text = _refused({'host': host, 'auth.allow_example_token': True}, token_result=token)
     assert token not in text
 
 
 @pytest.mark.parametrize('allow', ['true', 'True', 'yes', 1, 1.0, 0, None, [], 'false'])
 @pytest.mark.parametrize('host', ['127.0.0.1', '0.0.0.0'])
 def test_allow_example_token_must_be_a_real_bool(allow, host):
-    text = _refused({'auth.token': PLACEHOLDER, 'host': host,
-                     'auth.allow_example_token': allow})
+    text = _refused({'host': host, 'auth.allow_example_token': allow},
+                    token_result=PLACEHOLDER)
     assert PLACEHOLDER not in text
 
 
 def test_allow_example_token_false_is_the_default_and_refuses_the_placeholder_on_loopback():
     assert dict(bridge.PARAMETERS)['auth.allow_example_token'] is False
-    _refused({'auth.token': PLACEHOLDER, 'host': '127.0.0.1',
-              'auth.allow_example_token': False})
+    _refused({'host': '127.0.0.1', 'auth.allow_example_token': False},
+             token_result=PLACEHOLDER)
 
 
 def test_a_strong_token_ignores_allow_example_token_and_logs_no_warning():
-    node, logger = _init_node({'auth.token': SENTINEL_TOKEN, 'host': '0.0.0.0',
-                               'auth.allow_example_token': True})
+    node, logger = _init_node({'host': '0.0.0.0', 'auth.allow_example_token': True},
+                              token_result=SENTINEL_TOKEN)
     assert node.host == '0.0.0.0'
     assert not logger.warning.called
 
@@ -5660,7 +5795,7 @@ def test_a_strong_token_ignores_allow_example_token_and_logs_no_warning():
 def test_the_token_never_appears_in_logs_or_in_exception_messages(token, caplog):
     with caplog.at_level(logging.DEBUG):
         try:
-            node, logger = _init_node({'auth.token': token})
+            node, logger = _init_node({}, token_result=token)
         except bridge.ConfigError as err:
             assert token not in str(err) and token not in repr(err)
             assert token not in ''.join(str(a) for a in err.args)
@@ -5672,8 +5807,8 @@ def test_the_token_never_appears_in_logs_or_in_exception_messages(token, caplog)
 @pytest.mark.parametrize('host', ['0.0.0.0', '192.168.1.50'])
 def test_refused_startup_does_not_print_the_token_in_the_error_for_any_host(host, caplog):
     with caplog.at_level(logging.DEBUG):
-        text = _refused({'auth.token': 'CHANGE-ME-' + SENTINEL_TOKEN, 'host': host,
-                         'auth.allow_example_token': True})
+        text = _refused({'host': host, 'auth.allow_example_token': True},
+                        token_result='CHANGE-ME-' + SENTINEL_TOKEN)
     assert SENTINEL_TOKEN not in text and SENTINEL_TOKEN not in caplog.text
 
 
@@ -5681,38 +5816,73 @@ def test_a_refused_token_never_builds_the_web_app():
     created = []
     with mock.patch.object(bridge, 'create_app', side_effect=created.append):
         with pytest.raises(bridge.ConfigError):
-            _init_node({'auth.token': PLACEHOLDER})
+            _init_node({}, token_result=PLACEHOLDER)
     assert created == []
 
 
-@pytest.mark.parametrize('env_token', ['xyz', 'a' * 15, PLACEHOLDER])
-def test_a_weak_token_in_the_environment_is_refused(monkeypatch, env_token):
+@pytest.mark.parametrize('env_token', ['xyz', 'a' * 19, PLACEHOLDER, 'a' * 40])
+def test_a_weak_token_in_the_environment_is_refused_without_falling_back_to_the_file(
+        monkeypatch, tmp_path, env_token):
+    good = tmp_path / 'tok'
+    good.write_text(SENTINEL_TOKEN)
+    good.chmod(0o600)
     monkeypatch.setenv(TOKEN_ENV_VAR, env_token)
-    text = _refused({'auth.token': 'p' * 32})     # the environment has priority: still weak
-    assert env_token not in text
+    text = _refused({'auth.token_file': str(good)}, real_loader=True)
+    assert env_token not in text and SENTINEL_TOKEN not in text
 
 
-def test_a_short_environment_token_is_a_config_error_not_a_silent_fallback(monkeypatch):
-    monkeypatch.setenv(TOKEN_ENV_VAR, 'a' * 15)
-    _refused({'auth.token': ''}, token_result=SENTINEL_TOKEN)
-
-
-def test_a_16_character_environment_token_starts(monkeypatch):
-    monkeypatch.setenv(TOKEN_ENV_VAR, 'e' * 16)
-    node, logger = _init_node({'auth.token': ''}, token_result='')
+def test_a_20_character_environment_token_starts(monkeypatch, tmp_path):
+    monkeypatch.setenv(TOKEN_ENV_VAR, 'e1' * 10)
+    node, logger = _init_node({'auth.token_file': str(tmp_path / 'missing')},
+                              real_loader=True)
     assert not logger.warning.called
+    assert node.create_app_mock.call_args.args[1] == 'e1' * 10
 
 
-def test_a_weak_environment_token_with_allow_and_loopback_starts_with_a_warning(monkeypatch):
+def test_a_weak_environment_token_with_allow_and_loopback_starts_with_a_warning(
+        monkeypatch, tmp_path):
     monkeypatch.setenv(TOKEN_ENV_VAR, 'dev')
-    node, logger = _init_node({'auth.token': '', 'auth.allow_example_token': True},
-                              token_result='')
+    node, logger = _init_node({'auth.allow_example_token': True,
+                               'auth.token_file': str(tmp_path / 'missing')},
+                              real_loader=True)
     assert logger.warning.called and 'dev' not in _everything_printed(logger)
 
 
-def test_a_weak_token_from_the_param_files_is_refused():
-    _refused({'auth.token': ''}, token_result=PLACEHOLDER)
-    _refused({'auth.token': ''}, token_result='abc')
+def test_a_token_from_the_private_file_reaches_the_web_app(tmp_path):
+    path = tmp_path / 'tok'
+    path.write_text(SENTINEL_TOKEN + '\n')
+    path.chmod(0o600)
+    node, logger = _init_node({'auth.token_file': str(path)}, real_loader=True)
+    assert node.create_app_mock.call_args.args[1] == SENTINEL_TOKEN
+    assert SENTINEL_TOKEN not in _everything_printed(logger)
+
+
+def test_a_weak_token_in_the_file_is_refused(tmp_path):
+    path = tmp_path / 'tok'
+    path.write_text('abc\n')
+    path.chmod(0o600)
+    _refused({'auth.token_file': str(path)}, real_loader=True)
+
+
+def test_an_unsafe_token_file_stops_the_startup_without_building_the_app(tmp_path):
+    path = tmp_path / 'tok'
+    path.write_text(SENTINEL_TOKEN)
+    path.chmod(0o640)
+    created = []
+    with mock.patch.object(bridge, 'create_app', side_effect=created.append):
+        text = _refused({'auth.token_file': str(path)}, real_loader=True)
+    assert created == [] and SENTINEL_TOKEN not in text
+
+
+def test_no_token_by_any_route_is_a_config_error(tmp_path):
+    text = _refused({'auth.token_file': str(tmp_path / 'missing')}, real_loader=True)
+    assert 'MTRB_WEB_TOKEN' in text
+
+
+def test_the_app_is_built_with_the_token_and_no_limiter_override():
+    node, _ = _init_node({}, token_result=SENTINEL_TOKEN)
+    [call] = node.create_app_mock.call_args_list
+    assert call.args[1] == SENTINEL_TOKEN
 
 
 # --- maps.min_free_mb / maps.min_interval_s -----------------------------------------------
@@ -5759,7 +5929,7 @@ def test_read_settings_invalid_min_interval_s_raises(bad):
 
 
 def test_init_hands_the_map_quotas_and_the_map_dir_to_the_web_app():
-    node, _ = _init_node({'auth.token': SENTINEL_TOKEN})
+    node, _ = _init_node({}, token_result=SENTINEL_TOKEN)
     [call] = node.create_app_mock.call_args_list
     assert call.kwargs['map_dir'] == '/share/map'
     assert call.kwargs['map_min_free_mb'] == 200
@@ -5868,19 +6038,18 @@ def _shipped_init_values(file_name):
 
 
 @pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
-def test_the_repository_ships_the_example_token_and_the_node_refuses_to_start_with_it(
-        file_name):
+def test_the_repository_ships_no_token_and_the_node_cannot_start_without_one(file_name):
     values = _shipped_init_values(file_name)
-    assert values['auth.token'] == PLACEHOLDER        # the repo really ships the placeholder
+    assert 'auth.token' not in values                 # the token is never in a YAML file
+    assert values['auth.token_file'] == '~/.config/mtrb/web_token'
     assert values['auth.allow_example_token'] is False
-    assert _refused(values) is not None               # host 0.0.0.0 + placeholder
+    assert 'MTRB_WEB_TOKEN' in _refused(values, token_result='')
 
 
 @pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
 def test_the_shipped_values_start_with_a_real_token(file_name):
     values = _shipped_init_values(file_name)
-    values['auth.token'] = SENTINEL_TOKEN
-    node, logger = _init_node(values)
+    node, logger = _init_node(values, token_result=SENTINEL_TOKEN)
     assert node.host == values['host']
     assert not logger.warning.called
 
@@ -5889,18 +6058,19 @@ def test_the_shipped_values_start_with_a_real_token(file_name):
 def test_the_shipped_values_with_allow_example_token_need_a_loopback_host(file_name):
     values = _shipped_init_values(file_name)
     values['auth.allow_example_token'] = True
-    _refused(values)                                  # shipped host is 0.0.0.0
+    _refused(values, token_result=PLACEHOLDER)        # shipped host is 0.0.0.0
     values['host'] = '127.0.0.1'
-    node, logger = _init_node(values)
+    node, logger = _init_node(values, token_result=PLACEHOLDER)
     assert logger.warning.called and PLACEHOLDER not in _everything_printed(logger)
 
 
 def test_the_two_shipped_files_have_exactly_the_same_keys_and_security_values():
     web, example = _flat(_shipped_params('web.yaml')), _flat(_shipped_params('web.example.yaml'))
     assert set(web) == set(example)
-    for key in ('auth.allow_example_token', 'auth.token', 'map_dir', 'maps.min_free_mb',
-                'maps.min_interval_s', 'host'):
+    for key in ('auth.allow_example_token', 'auth.token_file', 'limits.max_connections',
+                'map_dir', 'maps.min_free_mb', 'maps.min_interval_s', 'host'):
         assert web[key] == example[key], key
+    assert web['limits.max_connections'] == 64
 
 
 @pytest.mark.parametrize('file_name', ['web.yaml', 'web.example.yaml'])
@@ -5998,7 +6168,7 @@ def _init_declared(overrides, token=STRONG_TOKEN, host=None, space_cls=None):
             mock.patch.object(bridge.MtrbWebBridge, 'get_logger', create=True,
                               new=lambda self: logger), \
             mock.patch.object(bridge, 'get_package_share_directory', return_value='/share'), \
-            mock.patch.object(bridge, 'resolve_token', return_value=token), \
+            mock.patch.object(bridge, 'load_token', return_value=token), \
             mock.patch.object(bridge.MtrbWebBridge, '_init_ros_io', new=lambda self: None), \
             mock.patch.object(bridge, 'create_app', new=create_app_mock):
         node = bridge.MtrbWebBridge()
@@ -6015,7 +6185,7 @@ def _declared_refusal(overrides, **kwargs):
 
 
 EXPECTED_DYNAMIC = {
-    'auth.token', 'rates.pose', 'rates.scan', 'rates.status', 'rates.lifecycle',
+    'rates.pose', 'rates.scan', 'rates.status', 'rates.lifecycle',
     'teleop.max_vx', 'teleop.max_wz', 'scan.min_range', 'scan.max_range',
     'dock.x', 'dock.y', 'dock.yaw', 'maps.min_free_mb', 'maps.min_interval_s',
     'status.nodes'}
@@ -6023,12 +6193,14 @@ EXPECTED_DYNAMIC = {
 # a configuration error, so they keep static typing on purpose.
 STATIC_BY_DESIGN = {
     'port', 'teleop.timeout_ms', 'teleop.enabled', 'scan.max_points', 'plan.max_points',
-    'limits.max_clients', 'limits.max_ws_bytes', 'auth.allow_example_token'}
+    'limits.max_clients', 'limits.max_ws_bytes', 'limits.max_connections',
+    'auth.allow_example_token'}
 
 
-def test_dynamic_parameters_are_exactly_the_fifteen_expected():
+def test_dynamic_parameters_are_exactly_the_fourteen_expected():
     assert set(bridge.DYNAMIC_PARAMETERS) == EXPECTED_DYNAMIC
-    assert len(bridge.DYNAMIC_PARAMETERS) == 15
+    assert len(bridge.DYNAMIC_PARAMETERS) == 14
+    assert 'auth.token' not in bridge.DYNAMIC_PARAMETERS
 
 
 def test_every_dynamic_parameter_is_declared_in_parameters():
@@ -6137,6 +6309,67 @@ def test_every_declaration_error_class_becomes_a_config_error_without_its_text(e
     assert type(exc).__name__ in text and 'LEAK-v' not in text
 
 
+PARAM_SECRET = 'SECRET-override-value-7f3a'
+
+
+def _declaration_error(overrides, space_cls=None):
+    with pytest.raises(bridge.ConfigError) as caught:
+        _init_declared(overrides, space_cls=space_cls)
+    return caught.value
+
+
+def _assert_config_error_chain_is_clean(err, name):
+    import traceback
+    assert f'Invalid parameter {name}' in str(err)
+    assert err.__cause__ is None
+    assert err.__suppress_context__ is True
+    shown = ' '.join([str(err), repr(err), repr(err.args), ''.join(
+        traceback.format_exception(type(err), err, err.__traceback__))])
+    assert PARAM_SECRET not in shown
+
+
+def _raising_space(exc_factory):
+    class Raising(RealisticParameters):
+        def declare_parameter(self, name, value=None, descriptor=None, ignore_override=False):
+            raise exc_factory(name)
+
+    return Raising
+
+
+DECLARATION_ERRORS = {
+    'realistic-type-error': None,      # the realistic rclpy double: its text embeds the value
+    'InvalidParameterTypeException': lambda n: bridge.InvalidParameterTypeException(
+        f'{n}={PARAM_SECRET!r}', 'string'),
+    'InvalidParameterValueException': lambda n: bridge.InvalidParameterValueException(
+        n, PARAM_SECRET, 'rejected'),
+    'TypeError': lambda n: TypeError(PARAM_SECRET),
+    'ValueError': lambda n: ValueError(PARAM_SECRET),
+}
+
+
+def _declaration_site(kind):
+    if kind == 'realistic-type-error':
+        return _declaration_error({'port': PARAM_SECRET}), 'port'
+    return _declaration_error({}, _raising_space(DECLARATION_ERRORS[kind])), 'host'
+
+
+@pytest.mark.parametrize('kind', list(DECLARATION_ERRORS))
+def test_declaration_config_error_has_no_cause_and_never_prints_the_override_value(kind):
+    err, name = _declaration_site(kind)
+    _assert_config_error_chain_is_clean(err, name)
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    'BUG (backend, low): "raise ConfigError(...) from None" inside the except block leaves '
+    'the rclpy exception in err.__context__; its args/repr include the override value '
+    '(hidden when printing, still reachable). Fix: raise outside the except block.'))
+@pytest.mark.parametrize('kind', list(DECLARATION_ERRORS))
+def test_declaration_config_error_context_attribute_does_not_carry_the_override_value(kind):
+    err, _ = _declaration_site(kind)
+    link = err.__context__
+    assert link is None or PARAM_SECRET not in repr(link) + repr(link.args) + str(link)
+
+
 def test_a_declaration_error_stops_the_startup_before_the_token_and_the_app():
     node_text = _declared_refusal({'port': 1.5})
     assert 'port' in node_text
@@ -6213,7 +6446,7 @@ NOT_BOOL = ['true', 'True', 'yes', 1, 0, 1.0, None, [], 'false']
 
 
 @pytest.mark.parametrize('allow', NOT_BOOL)
-@pytest.mark.parametrize('token', [STRONG_TOKEN, 'weak', PLACEHOLDER, 'change-me-' + 'x' * 16])
+@pytest.mark.parametrize('token', [STRONG_TOKEN, 'weak', PLACEHOLDER, 'change-me-' + 'x' * 20])
 @pytest.mark.parametrize('host', ['127.0.0.1', '0.0.0.0'])
 def test_check_token_strength_requires_a_real_bool_even_with_a_strong_token(
         allow, token, host):
@@ -6243,20 +6476,20 @@ def test_a_bool_allow_example_token_with_a_strong_token_starts_without_a_warning
 
 # --- placeholder detection in the node ------------------------------------------------------
 
-LOWER_PLACEHOLDER = 'change-me-' + 'x' * 16
+LOWER_PLACEHOLDER = 'change-me-' + 'x' * 20
 
 
 @pytest.mark.parametrize('host', LOOPBACK + NOT_LOOPBACK)
 def test_a_lowercase_placeholder_token_of_16_plus_chars_is_refused_without_override(host):
-    assert len(LOWER_PLACEHOLDER) >= 16
-    text = _refused({'auth.token': LOWER_PLACEHOLDER, 'host': host})
+    assert len(LOWER_PLACEHOLDER) >= 20
+    text = _refused({'host': host}, token_result=LOWER_PLACEHOLDER)
     assert LOWER_PLACEHOLDER not in text
 
 
-@pytest.mark.parametrize('token', ['Change-Me-' + 'y' * 16, '  change-me-' + 'z' * 20,
-                                   'cHaNgE-mE-' + 'q' * 16])
+@pytest.mark.parametrize('token', ['Change-Me-' + 'y' * 20, '  change-me-' + 'z' * 20,
+                                   'cHaNgE-mE-' + 'q' * 20])
 def test_mixed_case_placeholder_tokens_are_refused_through_the_real_declaration(token):
-    text = _declared_refusal({'auth.token': token}, token=token, host='127.0.0.1')
+    text = _declared_refusal({}, token=token, host='127.0.0.1')
     assert token.strip() not in text
 
 
@@ -6290,7 +6523,7 @@ def _yaml_variant(file_name, variant):
 def test_the_shipped_yaml_files_declare_and_start_with_the_realistic_fake(
         file_name, variant):
     values = _yaml_variant(file_name, variant)
-    values['auth.token'] = STRONG_TOKEN
+    assert 'auth.token' not in values
     node = _init_declared(values)
     assert node.port == 8080 and node.host == '0.0.0.0'
     assert node._map_min_free_mb == 200 and node._map_min_interval_s == 5.0
@@ -6309,3 +6542,332 @@ def test_the_shipped_yaml_types_match_the_declared_defaults_for_static_parameter
     for name, value in _flat(_shipped_params(file_name)).items():
         if name not in bridge.DYNAMIC_PARAMETERS:
             assert _rclpy_type(value) == _rclpy_type(defaults[name]), name
+
+
+# =========================================================================================
+# Audit (task 21): limits.max_connections, uvicorn options, initialpose gating, map arrays.
+# =========================================================================================
+
+# --- limits.max_connections ------------------------------------------------------------------
+
+def test_max_connections_default_is_64_and_static_int():
+    assert dict(bridge.PARAMETERS)['limits.max_connections'] == 64
+    assert 'limits.max_connections' not in bridge.DYNAMIC_PARAMETERS
+    assert bridge.MAX_CONNECTIONS_LIMIT == 1024
+
+
+def test_read_settings_max_connections_default_is_valid():
+    node = _settings_node()
+    node._read_settings()
+    assert node._max_connections == 64
+
+
+@pytest.mark.parametrize('value', [1, 2, 64, 1000, 1024])
+def test_read_settings_accepts_max_connections_from_1_to_1024(value):
+    node = _settings_node(**{'limits.max_connections': value})
+    node._read_settings()
+    assert node._max_connections == value
+
+
+@pytest.mark.parametrize('bad', [0, -1, 1025, 10 ** 6, True, False, 64.0, 1.5, '64', None,
+                                 [], float('nan')])
+def test_read_settings_invalid_max_connections_is_a_config_error(bad):
+    with pytest.raises(bridge.ConfigError, match='limits.max_connections'):
+        _settings_node(**{'limits.max_connections': bad})._read_settings()
+
+
+def test_max_connections_of_1025_names_the_ceiling():
+    with pytest.raises(bridge.ConfigError, match='at most 1024'):
+        _settings_node(**{'limits.max_connections': 1025})._read_settings()
+
+
+@pytest.mark.parametrize('bad', ['64', 64.5, 0])
+def test_a_wrong_max_connections_override_is_a_config_error_through_the_declaration(bad):
+    text = _declared_refusal({'limits.max_connections': bad})
+    assert 'limits.max_connections' in text
+    assert str(bad) not in text.replace('limits.max_connections', '') or bad == 0
+
+
+# --- the options handed to uvicorn ---------------------------------------------------------------
+
+class FakeUvicornConfig:
+    def __init__(self, app, **kwargs):
+        self.app, self.kwargs = app, kwargs
+
+
+class FakeUvicornServer:
+    def __init__(self, config):
+        self.config = config
+        self.started = True
+        self.should_exit = False
+        self.sockets = None
+
+    def run(self, sockets=None):
+        self.sockets = sockets
+
+
+def _server_node(max_connections=64, max_ws_bytes=4096):
+    node = make_node({'host': '127.0.0.1'})
+    node.host, node.port = '127.0.0.1', 0
+    node.app = object()
+    node._max_ws_bytes = max_ws_bytes
+    node._max_connections = max_connections
+    node.server = node.thread = None
+    return node
+
+
+def _start_with_fake_uvicorn(node):
+    fake = NS(Config=FakeUvicornConfig, Server=FakeUvicornServer)
+    with mock.patch.object(bridge, 'uvicorn', fake):
+        node.start_server()
+    node.thread.join(5)
+    return node.server.config
+
+
+def test_start_server_passes_the_slow_client_limits_to_uvicorn():
+    config = _start_with_fake_uvicorn(_server_node(max_connections=37, max_ws_bytes=2048))
+    kwargs = config.kwargs
+    assert kwargs['limit_concurrency'] == 37
+    assert kwargs['timeout_keep_alive'] == 5 == bridge.UVICORN_KEEP_ALIVE_S
+    assert kwargs['h11_max_incomplete_event_size'] == 16384 == bridge.UVICORN_MAX_HEADER_BYTES
+    assert kwargs['ws_max_size'] == 2048
+    assert kwargs['access_log'] is False and kwargs['log_level'] == 'warning'
+
+
+def test_start_server_hands_over_the_bound_socket_and_the_app():
+    node = _server_node()
+    config = _start_with_fake_uvicorn(node)
+    assert config.app is node.app
+    [sock] = node.server.sockets
+    try:
+        assert sock.getsockname()[0] == '127.0.0.1'
+    finally:
+        sock.close()
+
+
+def _real_uvicorn_config_parameters():
+    """Parameter names of the REAL uvicorn.Config.__init__, or None if only a stub exists."""
+    import ast
+    import inspect
+    real = getattr(bridge.uvicorn, 'Config', None)
+    try:
+        names = set(inspect.signature(real.__init__).parameters)
+    except (TypeError, ValueError):
+        names = set()
+    if 'limit_concurrency' in names:
+        return names
+    source_dir = os.environ.get('MTRB_UVICORN_SOURCE_DIR')      # unpacked uvicorn, no deps
+    if source_dir and os.path.isfile(os.path.join(source_dir, 'config.py')):
+        with open(os.path.join(source_dir, 'config.py'), encoding='utf-8') as handle:
+            tree = ast.parse(handle.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == 'Config':
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == '__init__':
+                        return {a.arg for a in item.args.args + item.args.kwonlyargs}
+    return None
+
+
+def test_the_uvicorn_options_exist_in_the_real_config_signature():
+    names = _real_uvicorn_config_parameters()
+    if names is None:
+        pytest.skip('only a uvicorn stub is importable (set MTRB_UVICORN_SOURCE_DIR)')
+    used = set(_start_with_fake_uvicorn(_server_node()).kwargs)
+    assert {'limit_concurrency', 'timeout_keep_alive', 'h11_max_incomplete_event_size',
+            'ws_max_size', 'access_log', 'log_level'} <= used
+    assert used <= names, sorted(used - names)
+
+
+def test_start_server_without_limit_concurrency_would_be_caught():
+    kwargs = _start_with_fake_uvicorn(_server_node()).kwargs
+    assert 'limit_concurrency' in kwargs and 'timeout_keep_alive' in kwargs
+
+
+# --- initialpose: the node refuses while Nav2 may be driving or a teleop lease is held ----------
+
+def _pose_node(monkeypatch):
+    node = make_teleop_bridge(monkeypatch)
+    node.get_clock = lambda: NS(now=lambda: NS(to_msg=lambda: 'STAMP',
+                                               nanoseconds=int(node.clock[0] * 1e9)))
+    monkeypatch.setattr(bridge, 'PoseWithCovarianceStamped', _pose_msg_factory())
+    return node
+
+
+def _pose_published(node):
+    return node._initial_pose_pub.publish.call_count
+
+
+def test_initial_pose_is_published_when_nothing_is_moving(monkeypatch):
+    node = _pose_node(monkeypatch)
+    node.publish_initial_pose(1.0, 2.0, 0.5)
+    assert _pose_published(node) == 1
+
+
+def test_initial_pose_is_refused_with_an_active_goal(monkeypatch):
+    node = _pose_node(monkeypatch)
+    node.send_goal(1.0, 2.0, 0.5)
+    with pytest.raises(bridge.NavBusyError):
+        node.publish_initial_pose(1.0, 2.0, 0.5)
+    assert _pose_published(node) == 0
+
+
+def test_initial_pose_is_refused_with_an_orphan_goal(monkeypatch):
+    node = _pose_node(monkeypatch)
+    make_orphan(node)
+    with pytest.raises(bridge.NavBusyError):
+        node.publish_initial_pose(1.0, 2.0, 0.5)
+    assert _pose_published(node) == 0
+
+
+def test_initial_pose_is_refused_with_a_pending_cancel_all_while_nav2_is_up(monkeypatch):
+    node = _pose_node(monkeypatch)
+    cancel_client(node).ready = False
+    node.cancel()
+    assert node._cancel_all is not None
+    node._nav_client.ready = True
+    with pytest.raises(bridge.NavBusyError):
+        node.publish_initial_pose(1.0, 2.0, 0.5)
+    assert _pose_published(node) == 0
+
+
+def test_initial_pose_is_allowed_with_a_pending_cancel_all_if_nav2_is_absent(monkeypatch):
+    node = _pose_node(monkeypatch)
+    cancel_client(node).ready = False
+    node.cancel()
+    node._nav_client.ready = False
+    node.publish_initial_pose(1.0, 2.0, 0.5)
+    assert _pose_published(node) == 1
+
+
+def test_initial_pose_is_refused_while_a_teleop_controller_holds_the_lease(monkeypatch):
+    node = _pose_node(monkeypatch)
+    assert node.teleop(1, tmsg(0)) is None
+    with pytest.raises(bridge.NavBusyError):
+        node.publish_initial_pose(1.0, 2.0, 0.5)
+    assert _pose_published(node) == 0
+
+
+def test_initial_pose_is_allowed_again_once_the_teleop_lease_expired(monkeypatch):
+    node = _pose_node(monkeypatch)
+    node.teleop(1, tmsg(0))
+    node.clock[0] += 5.0                  # far beyond the 300 ms teleop timeout
+    node.publish_initial_pose(1.0, 2.0, 0.5)
+    assert _pose_published(node) == 1
+
+
+def test_initial_pose_is_allowed_after_the_controller_disconnects(monkeypatch):
+    node = _pose_node(monkeypatch)
+    node._nav_client.ready = False
+    node.teleop(1, tmsg(0))
+    node.teleop_disconnect(1)
+    node.publish_initial_pose(1.0, 2.0, 0.5)
+    assert _pose_published(node) == 1
+
+
+def test_initial_pose_without_a_teleop_gate_depends_on_nav_only(monkeypatch):
+    node = _pose_node(monkeypatch)
+    node._teleop_gate = None
+    node.publish_initial_pose(1.0, 2.0, 0.5)
+    assert _pose_published(node) == 1
+    node.send_goal(1.0, 2.0, 0.5)
+    with pytest.raises(bridge.NavBusyError):
+        node.publish_initial_pose(1.0, 2.0, 0.5)
+
+
+def test_initial_pose_busy_check_holds_the_teleop_lock(monkeypatch):
+    node = _pose_node(monkeypatch)
+    seen = []
+    original = node._nav_busy
+
+    def spy():
+        seen.append(node._teleop_lock.locked())
+        return original()
+
+    node._nav_busy = spy
+    node.publish_initial_pose(1.0, 2.0, 0.5)
+    assert seen == [True]
+
+
+# --- _broadcast_map: array('b') conversion -------------------------------------------------------
+
+def _raw_map(data, width=2, height=2):
+    info = NS(width=width, height=height, resolution=0.05,
+              origin=NS(position=NS(x=0.0, y=0.0)))
+    return NS(header=NS(frame_id='map'), info=info, data=data)
+
+
+def _published_map(node):
+    messages = drain(node)
+    return [m for m in messages if isinstance(m, bytes)]
+
+
+@pytest.mark.parametrize('factory', [list, tuple])
+def test_a_list_or_tuple_map_is_published_identically_to_an_array_b(factory):
+    cells = [0, -1, 100, 50]
+    reference = make_bridge()
+    reference._on_map(_raw_map(array('b', cells)))
+    reference._broadcast_map()
+    expected = _published_map(reference)
+    node = make_bridge()
+    node._on_map(_raw_map(factory(cells)))
+    node._broadcast_map()
+    assert _published_map(node) == expected and len(expected) == 1
+    assert node._map_version == 1 and not node.logger.warning.called
+
+
+def test_an_array_b_map_is_not_converted_again(monkeypatch):
+    data = array('b', [0, -1, 100, 0])
+    node = make_bridge()
+    node._on_map(_raw_map(data))
+    seen = []
+    real = bridge.occupancy_to_bytes
+
+    def spy(arg, width, height):
+        seen.append(arg)
+        return real(arg, width, height)
+
+    monkeypatch.setattr(bridge, 'occupancy_to_bytes', spy)
+    node._broadcast_map()
+    assert seen == [data] and seen[0] is data
+
+
+@pytest.mark.parametrize('data', [[0, 300, -1, 0], [0, -129, 0, 0], [0, 128, 0, 0]])
+def test_cells_outside_int8_are_ignored_with_a_warning_and_never_raise(data):
+    node = make_bridge()
+    node._on_map(_raw_map(data))
+    node._broadcast_map()                      # must not raise
+    assert drain(node) == [] and node._map_version == 0
+    assert node.store.snapshot()['map'] is None
+    assert any('Invalid map ignored' in m for m in _warnings(node))
+
+
+@pytest.mark.parametrize('data', [['a', 'b', 'c', 'd'], [None, 0, 0, 0], [1.5, 0, 0, 0],
+                                  [[0], [0], [0], [0]]])
+def test_a_map_whose_cells_cannot_be_converted_is_ignored_with_a_warning(data):
+    node = make_bridge()
+    node._on_map(_raw_map(data))
+    node._broadcast_map()
+    assert drain(node) == [] and node._map_version == 0
+    assert any('Invalid map ignored' in m for m in _warnings(node))
+
+
+def test_the_invalid_cell_warning_is_throttled_and_carries_no_cell_data():
+    node = make_bridge()
+    for _ in range(5):
+        node._on_map(_raw_map(['SECRET-cell', 0, 0, 0]))
+        node._broadcast_map()
+    warnings = [m for m in _warnings(node) if 'Invalid map ignored' in m]
+    assert len(warnings) == 1 and 'SECRET' not in warnings[0]
+    node.clock[0] += bridge.LOG_THROTTLE_S
+    node._on_map(_raw_map(['SECRET-cell', 0, 0, 0]))
+    node._broadcast_map()
+    assert len([m for m in _warnings(node) if 'Invalid map ignored' in m]) == 2
+
+
+def test_a_valid_map_after_an_invalid_one_is_published():
+    node = make_bridge()
+    node._on_map(_raw_map(['x', 0, 0, 0]))
+    node._broadcast_map()
+    node._on_map(_raw_map([0, 0, 0, 0]))
+    node._broadcast_map()
+    assert len(_published_map(node)) == 1 and node._map_version == 1

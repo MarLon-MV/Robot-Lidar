@@ -50,6 +50,7 @@ button:hover { background: #354356; }
 #login-form h2 { margin: 0 0 4px; }
 #login-form input { font: inherit; padding: 10px; border-radius: 6px; border: 1px solid #3d4b5d;
   background: #0e1218; color: var(--fg); }
+#login-warning { color: var(--amber, #e0a800); margin: 0; font-size: 0.9em; }
 #login-error { color: var(--red); margin: 0; }
 #topbar { flex-wrap: wrap; }
 .btn-stop { background: #a8262b; border-color: #d9484d; font-weight: 600; }

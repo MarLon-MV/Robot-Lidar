@@ -57,6 +57,8 @@
   var CANCEL_TIMEOUT_MS = 3000;    // /api/cancel and /api/stop must fail fast to allow an immediate retry
   // INITIAL, must match web.yaml (teleop.max_vx / teleop.max_wz). The server saturates anyway;
   // the client never asks for more than this.
+  var MSG_TOO_MANY = 'Demasiados intentos con un token incorrecto. Espera un minuto y vuelve a probar.';
+  var LOCKOUT_RETRY_MS = 35000;    // after a 429 / close 1008 do not reconnect sooner than this
   var MAX_VX = 0.2;                // m/s
   // INITIAL, must match web.yaml
   var MAX_WZ = 0.8;                // rad/s
@@ -70,7 +72,15 @@
     canceled: 'Cancelado', failed: 'Fallido' };
   // User-facing Spanish message for a failed command. `status` is the HTTP status
   // (0 = no response), `code` the server's `error` field. Never exposes technical detail.
-  function describeApiError(status, code) {
+  function describeApiError(status, code, path) {
+    if (status === 429 && code === 'too_many_attempts') return MSG_TOO_MANY;
+    if (path === '/api/initialpose') {
+      if (status === 400 && code === 'invalid_pose') return 'La pose inicial está fuera del mapa';
+      if (status === 409 && code === 'goal_active') {
+        return 'No se puede fijar la pose inicial mientras el robot navega o se teleopera. Detén el robot primero.';
+      }
+      if (status === 503 && code === 'no_map') return 'Aún no hay mapa';
+    }
     if (status === 401) return 'Sesión no válida: introduce el token de nuevo.';
     if (status === 409 && code === 'goal_active') return 'Ya hay una navegación activa; cancélala primero.';
     if (status === 409 && code === 'wrong_mode') {
@@ -667,15 +677,15 @@
 
   function checkTokenValid() {
     // The WS handshake failure does not say why; ask a REST endpoint to tell 401 apart.
-    if (!isValidToken(state.token)) return Promise.resolve(false);
+    if (!isValidToken(state.token)) return Promise.resolve('invalid');
     return fetch('/api/state', { headers: { Authorization: 'Bearer ' + state.token } })
-      .then(function (r) { return r.status !== 401; })
-      .catch(function () { return true; });
+      .then(function (r) { return r.status === 401 ? 'invalid' : r.status === 429 ? 'limited' : 'ok'; })
+      .catch(function () { return 'ok'; });
   }
 
-  function scheduleRetry() {
+  function scheduleRetry(minMs) {
     clearTimeout(state.retryTimer);
-    state.retryTimer = setTimeout(connect, state.retryMs);
+    state.retryTimer = setTimeout(connect, Math.max(state.retryMs, minMs || 0));
     state.retryMs = Math.min(BACKOFF_MAX_MS, Math.round(state.retryMs * 1.5));
   }
 
@@ -695,13 +705,27 @@
       state.connected = false;
       state.ws = null;
       teleopConnectionLost();
-      state.closeNotice = (ev && ev.code === 1013) ?
+      var locked = !!ev && ev.code === 1008;
+      state.closeNotice = locked ? MSG_TOO_MANY : (ev && ev.code === 1013) ?
         'Demasiados clientes conectados al robot. Reintentando…' : '';
       updateStatus();
       updateActions();
       updateRobotPanel();
-      checkTokenValid().then(function (ok) {
-        if (!ok) {
+      if (locked) {
+        // Rate-limited: no probe request (it would count as another failure), long wait.
+        showLogin(MSG_TOO_MANY);
+        scheduleRetry(LOCKOUT_RETRY_MS);
+        return;
+      }
+      checkTokenValid().then(function (res) {
+        if (res === 'limited') {
+          state.closeNotice = MSG_TOO_MANY;
+          showLogin(MSG_TOO_MANY);
+          updateStatus();
+          scheduleRetry(LOCKOUT_RETRY_MS);
+          return;
+        }
+        if (res === 'invalid') {
           state.authFailed = true;
           clearToken();
           state.token = '';
@@ -989,7 +1013,7 @@
           state.goalRejected = true;
         }
         showMessage(res.timeout ? 'Sin respuesta del robot; pulsa de nuevo.' :
-          describeApiError(res.status, res.data && res.data.error), true);
+          describeApiError(res.status, res.data && res.data.error, path), true);
         if (res.status === 401) {
           disconnect();
           clearToken();
