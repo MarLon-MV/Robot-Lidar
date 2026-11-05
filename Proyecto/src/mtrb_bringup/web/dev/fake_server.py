@@ -5,7 +5,7 @@ Usage (from Proyecto/src/mtrb_bringup/web/dev):
     python fake_server.py [--port 8080] [--token dev-token] [--mode map|mapping]
                           [--fail none|409|503|401|400|teleop|save409|save503|saveslow|savetimeout|
                                 savebackup|savelimit|savedisk|saveratelimit|
-                                initpose400|initpose409|initpose503]
+                                initpose400|initpose409|initpose503|stop503]
                           [--no-dock] [--maps lab,casa] [--no-posegraph] [--stale]
 --fail makes POST /api/goal, /api/dock and /api/cancel answer that error
 (409 goal_active, 503 nav_unavailable, 401 unauthorized, 400 invalid_goal).
@@ -27,7 +27,12 @@ insufficient_storage, saveratelimit -> 429 save_rate_limited.
 --fail initpose400|initpose409|initpose503 make POST /api/initialpose answer 400 invalid_pose,
 409 goal_active or 503 no_map (after body validation).
 Token brute-force limit like the real server: 10 wrong tokens in 60 s from one IP lock that IP
-for 60 s: REST answers 429 too_many_attempts and the WS closes with code 1008.
+for 60 s: REST answers 429 too_many_attempts (except POST /api/stop with a VALID token, which
+always answers 200) and the WS handshake is rejected with HTTP 403 BEFORE accepting (a wrong
+token or a locked IP never gets accept + close 1008). The WS also checks Origin against Host
+(mismatch -> rejected before accept; no Origin -> allowed). Every response carries the real
+security headers (X-Frame-Options, nosniff, Referrer-Policy, CSP).
+--fail stop503 makes POST /api/stop answer 503 (saturated server) to test the PARAR message.
 The status message carries nodes, scan_age and odom_age like the real server.
 Then open http://localhost:8080/ and enter the token. Not installed with the package.
 """
@@ -40,6 +45,7 @@ import re
 import secrets
 import struct
 import time
+from urllib.parse import urlsplit
 import zlib
 
 from fastapi import FastAPI, Request, WebSocket
@@ -54,6 +60,15 @@ STATIC = {
 }
 WIDTH, HEIGHT, RES = 200, 160, 0.05
 ORIGIN = (-5.0, -4.0)
+SECURITY_HEADERS = {
+    'X-Frame-Options': 'DENY',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': (
+        "default-src 'self'; script-src 'self'; style-src 'self'; "
+        "connect-src 'self' ws: wss:; img-src 'self' data: blob:; "
+        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"),
+}
 
 
 def make_map():
@@ -181,6 +196,14 @@ def create_app(token, mode='mapping', fail='none', with_dock=True, maps=None,
                posegraph=True, stale=False):
     """Build the fake app serving static files, /api/*, and /ws."""
     app = FastAPI()
+
+    @app.middleware('http')
+    async def security_headers(request: Request, call_next):
+        response = await call_next(request)
+        for key, value in SECURITY_HEADERS.items():
+            response.headers[key] = value
+        return response
+
     limiter = AuthLimiter()
     nav = {'state': 'idle', 'distance': None, 'log': []}
     saved = list(maps if maps is not None else ['lab', 'casa'])
@@ -260,9 +283,15 @@ def create_app(token, mode='mapping', fail='none', with_dock=True, maps=None,
 
     @app.post('/api/stop')
     async def stop(request: Request):
-        bad = guard(request)
-        if bad:
-            return bad
+        # Valid token: always 200, even from a locked IP (the stop must never be refused).
+        auth = request.headers.get('authorization', '')
+        if secrets.compare_digest(auth, 'Bearer ' + token):
+            if fail == 'stop503':
+                return JSONResponse({'error': 'nav_unavailable', 'detail': 'Saturated'}, 503)
+        else:
+            bad = guard(request)
+            if bad:
+                return bad
         nav.update(state='canceled', distance=None)
         log('POST /api/stop')
         return {'ok': True}
@@ -333,13 +362,21 @@ def create_app(token, mode='mapping', fail='none', with_dock=True, maps=None,
     async def ws(websocket: WebSocket):
         given = websocket.query_params.get('token', '')
         ip = _ip(websocket)
+        # The real server rejects BEFORE accepting (HTTP 403 on the handshake); it never does
+        # accept + close 1008. The client still handles a 1008 close (harmless), but it is no
+        # longer the real path.
+        origin = websocket.headers.get('origin')
+        host = websocket.headers.get('host', '')
+        if origin is not None and urlsplit(origin).netloc != host:
+            log('WS rejected: origin mismatch', origin)
+            await websocket.close(code=1008)
+            return
         if limiter.is_locked(ip):
-            await websocket.accept()   # accept first so the browser sees close code 1008
             await websocket.close(code=1008)
             return
         if not secrets.compare_digest(given, token):
             limiter.record_failure(ip)
-            await websocket.close(code=1008)   # before accept: handshake rejected (403)
+            await websocket.close(code=1008)
             return
         await websocket.accept()
         await websocket.send_json(meta)
@@ -414,7 +451,8 @@ def main():
     parser.add_argument('--token', default='dev-token')
     parser.add_argument('--mode', choices=('map', 'mapping'), default='mapping')
     parser.add_argument(
-        '--fail', choices=('none', 'teleop') + tuple(FAILURES) + SAVE_FAILS + tuple(INIT_FAILS),
+        '--fail', choices=('none', 'teleop') + tuple(FAILURES) + SAVE_FAILS + tuple(INIT_FAILS)
+        + ('stop503',),
         default='none')
     parser.add_argument('--no-dock', action='store_true')
     parser.add_argument('--maps', default='lab,casa', help='comma separated saved map names')

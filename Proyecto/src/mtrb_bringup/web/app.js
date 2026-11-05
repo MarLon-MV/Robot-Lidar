@@ -1618,6 +1618,8 @@
   }
 
   // PARAR: WS stop AND POST /api/stop, both fired right away and independent of each other.
+  var MSG_STOP_PHYSICAL = 'USA LA PARADA FÍSICA del robot.';
+  var MSG_STOP_SATURATED = 'Servidor saturado: la parada por red puede no haber llegado. USA LA PARADA FÍSICA del robot.';
   var stopStatusTimer = null;
   function showStopStatus(text, isError) {
     var el = $('stop-status');
@@ -1645,11 +1647,19 @@
     } catch (e) {
       done = Promise.resolve({ ok: false, status: 0, data: {} });
     }
+    var hadWs = wsOpen();
     done.then(function (res) {
       if (res.ok) return;
+      // 503 = server saturated (connection limit): the network stop may not have arrived.
+      // A failed POST with no open WebSocket leaves no network path either: same warning.
+      if (res.status === 503) {
+        showStopStatus(MSG_STOP_SATURATED, true);
+        return;
+      }
       var why = res.timeout || res.status === 0 ? 'No se pudo enviar la parada por HTTP' :
         describeApiError(res.status, res.data && res.data.error).replace(/\.$/, '');
-      showStopStatus('Error: ' + why + '. ¡Pulsa de nuevo!', true);
+      var tail = hadWs ? '' : ' ' + MSG_STOP_PHYSICAL;
+      showStopStatus('Error: ' + why + '. ¡Pulsa de nuevo!' + tail, true);
     });
   }
   $('btn-stop-all').addEventListener('click', emergencyStop);
