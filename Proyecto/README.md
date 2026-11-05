@@ -131,7 +131,7 @@ cd ~/Robot-Lidar/Proyecto
 sudo apt install -y python3-vcstool
 vcs import src < mtrb.repos
 
-# Parche para compilar el driver con GCC 13 (Jazzy): falta #include <pthread.h> y hay una errata
+# Parche del driver para GCC 13 (Jazzy) y exclusión de multirobot_map_merge (no se usa)
 scripts/patch_ldlidar.sh
 ```
 
