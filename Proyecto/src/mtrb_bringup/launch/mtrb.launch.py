@@ -180,6 +180,9 @@ def _slam(s):
 
     slam = _node(s, 'slam_toolbox', 'async_slam_toolbox_node', 'slam_toolbox',
                  parameters=[_param_file(s, 'slam_params_file'), overrides],
+                 # slam_toolbox publishes the absolute /map; Nav2 and the web bridge read
+                 # /<ns>/map, so bring it into the namespace (like map_server does).
+                 remappings=[('/map', 'map'), ('/map_metadata', 'map_metadata')],
                  cls=LifecycleNode)
 
     def transition(transition_id):
