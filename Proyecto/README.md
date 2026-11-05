@@ -1,8 +1,76 @@
-# MTRB — ROS 2 Jazzy workspace
+# MTRB — Robot móvil con ROS 2 Jazzy, Nav2 e interfaz web
 
-iRobot Create 3 (firmware I.0.0.CycloneDDS, namespace `/r2`, dominio 21) + LiDAR 2D
-[LDROBOT LD19 (youyeetoo FHL-LD19)](https://github.com/ldrobotSensorTeam/ldlidar_stl_ros2), con Nav2.
-Se desarrolla en macOS y se despliega en una Raspberry Pi 5 (ROS 2 Jazzy nativo, sin Docker).
+## Resumen
+
+**MTRB** es un robot móvil: un iRobot Create 3 (firmware I.0.0.CycloneDDS, namespace `/r2`,
+dominio 21) con un LiDAR 2D
+[LDROBOT LD19 (youyeetoo FHL-LD19)](https://github.com/ldrobotSensorTeam/ldlidar_stl_ros2), que corre
+**ROS 2 Jazzy con Nav2 y slam_toolbox** en una Raspberry Pi 5 (nativo, sin Docker). Se desarrolla en
+macOS y se despliega en la Pi.
+
+Tiene dos modos, que se eligen con `mode:=` al lanzar:
+
+| Modo | Para qué sirve | Localización |
+| --- | --- | --- |
+| `mode:=mapping` | Crear un mapa nuevo, o ampliar uno guardado | slam_toolbox |
+| `mode:=map` | Navegar de forma autónoma sobre un mapa ya guardado | AMCL + map_server |
+
+Con `web:=true` el robot sirve además una **interfaz web** (sustituye a RViz) desde la propia Pi.
+Se abre en cualquier navegador de la misma red, sin instalar nada, y permite:
+
+- ver en tiempo real el **mapa, el robot, el LiDAR y la ruta**;
+- enviar **objetivos de navegación** a Nav2, cancelarlos y **volver al dock**;
+- **teleoperar** con joystick o teclado (con límites de velocidad y un watchdog de 300 ms);
+- **parar** el robot con un botón siempre visible;
+- **guardar y listar mapas**, y ver el estado de los nodos y de la batería.
+
+> **Estado.** El código está implementado, revisado y probado **en macOS** (más de 1500 tests, análisis
+> de seguridad y revisión final). **Todavía no se ha probado en el robot real.** Antes de moverlo con la
+> web, sigue la primera prueba física de la sección 2.1.7, con las ruedas en el aire y la parada física
+> del Create 3 al alcance. La web **no** es el freno de emergencia.
+
+### Inicio rápido (ya instalado)
+
+La primera vez hay que instalar y configurar todo: apartados **1.1–1.8** (ROS, Create 3, LiDAR),
+**2.1.1** (dependencias Python de la web) y **2.1.2** (token). Después, en cada sesión:
+
+```bash
+cd ~/Robot-Lidar/Proyecto && source env.sh          # entorno (dominio 21, CycloneDDS)
+export MTRB_WEB_TOKEN='<token de 20 o más caracteres>'   # o el archivo ~/.config/mtrb/web_token
+
+# Mapear (el robot arranca en el dock) con la interfaz web:
+ros2 launch mtrb_bringup mtrb.launch.py mode:=mapping web:=true
+
+# Navegar sobre un mapa guardado (ruta absoluta):
+ros2 launch mtrb_bringup mtrb.launch.py mode:=map map:=/home/<usuario>/mtrb_maps/<nombre>.yaml web:=true
+```
+
+Después abre `http://<ip-de-la-pi>:8080` e introduce el token. Sin `web:=true` el robot funciona igual,
+solo que sin la interfaz.
+
+### Seguridad en cinco líneas
+
+1. **Solo red local y sin cifrado** (HTTP): usa una red dedicada y no expongas el puerto a internet.
+2. **El token es obligatorio** (mínimo 20 caracteres): el nodo se niega a arrancar sin él. Nunca va en
+   un YAML ni en git, ni es un parámetro de ROS.
+3. **La web no sustituye a la parada física** del Create 3.
+4. Tras 10 intentos fallidos de token, esa IP queda bloqueada 60 s.
+5. El dominio ROS 2 (21) no tiene autenticación: quien esté en esa red puede saltarse la web.
+
+### Qué leer según lo que quieras hacer
+
+| Quiero… | Ver |
+| --- | --- |
+| Instalar todo desde cero | apartado 1 |
+| Lanzar el robot y elegir el modo | apartado 2 |
+| Usar la interfaz web, el token y los mapas | apartado 2.1 |
+| Probar la web por primera vez en el robot | apartado 2.1.7 |
+| Entender topics, namespaces y remapeos | apartado 3 |
+| Ejecutar las pruebas o contribuir | apartados 5 y 6 |
+| Saber qué falta por hacer | apartado 7 |
+| Diseño, decisiones y especificación | `../docs/` (`arquitectura.md`, `decisiones/`, `specs/`) |
+
+## Estructura del proyecto
 
 ```
 src/
