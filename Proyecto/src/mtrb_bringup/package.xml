@@ -4,7 +4,7 @@
   <name>mtrb_bringup</name>
   <version>0.1.0</version>
   <description>Single launch (map|mapping), Nav2, EKF and slam_toolbox configuration for the MTRB robot (Create 3 + 2D LiDAR)</description>
-  <maintainer email="brandonvicente716@gmail.com">Brandon Vicente</maintainer>
+  <maintainer>MarLon</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>

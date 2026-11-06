@@ -4,7 +4,7 @@
   <name>mtrb_description</name>
   <version>0.1.0</version>
   <description>URDF/xacro of the iRobot Create 3 plus a 2D LiDAR for the MTRB robot</description>
-  <maintainer email="brandonvicente716@gmail.com">Brandon Vicente</maintainer>
+  <maintainer >MarLon</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
